@@ -1,0 +1,18 @@
+# Build output (several GB)
+/target/
+
+# Generated release files: publish the AppImage as a release, not in git
+/dist/
+
+# Test screenshots
+/shots/
+
+# Downloaded build tool (appimagetool), fetched again by packaging/build-appimage.sh
+/packaging/tools/
+
+# Editor / OS clutter
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/

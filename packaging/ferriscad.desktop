@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=FerrisCad
+GenericName=Electronics design
+Comment=Schéma, circuit imprimé et débogage de circuit assisté par IA
+Exec=ferriscad %f
+Icon=ferriscad
+Terminal=false
+Categories=Development;Electronics;Engineering;
+Keywords=schematic;pcb;kicad;electronics;ai;
