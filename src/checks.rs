@@ -380,6 +380,8 @@ pub struct PadItem {
     pub tht: bool,
     pub back: bool,
     pub net: Option<usize>,
+    /// Drill (mm) given by the footprint for a through-hole pad; 0 = estimate.
+    pub drill: f32,
 }
 
 impl PadItem {
@@ -429,7 +431,22 @@ pub fn pad_items(p: &Project, nl: &Netlist) -> Vec<PadItem> {
                 tht: pd.tht,
                 back: pd.back,
                 net: nl.net_of(ci, pi),
+                drill: 0.0,
             });
+            for e in &pd.extra {
+                let r = rot_f(e.pos, c.pcb_rot);
+                v.push(PadItem {
+                    ci,
+                    pi,
+                    pos: (c.pcb_pos.0 + r.0, c.pcb_pos.1 + r.1),
+                    size: if c.pcb_rot % 2 == 1 { (e.size.1, e.size.0) } else { e.size },
+                    round: e.shape == PadShape::Round,
+                    tht: e.tht,
+                    back: e.back,
+                    net: nl.net_of(ci, pi),
+                    drill: e.drill,
+                });
+            }
         }
     }
     v
@@ -509,7 +526,13 @@ pub fn drc(p: &Project, nl: &Netlist) -> (Vec<Issue>, PcbConn) {
     let z0 = np + nt + nv;
     for (zi, z) in p.zones.iter().enumerate() {
         let inside = |q: (f32, f32)| z.polys.iter().any(|poly| point_in_poly(q, poly));
+        // A drawn zone has no carved clearances yet: it only joins its own net, the other nets
+        // inside it are assumed to be kept clear when the zone is filled.
+        let zn = if z.drawn { nl.find(&z.net) } else { None };
         for (k, pad) in pads.iter().enumerate() {
+            if z.drawn && (zn.is_none() || pad.net != zn) {
+                continue;
+            }
             let on = match z.layer {
                 Some(l) => pad.on(l),
                 None => pad.tht,
@@ -521,6 +544,9 @@ pub fn drc(p: &Project, nl: &Netlist) -> (Vec<Issue>, PcbConn) {
                 uf.union(z0 + zi, k);
             }
         }
+        if z.drawn {
+            continue;
+        }
         for (i, v) in p.vias.iter().enumerate() {
             let r = v.size * 0.45;
             if [(0.0, 0.0), (r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)].iter().any(|d| inside((v.pos.0 + d.0, v.pos.1 + d.1))) {
@@ -530,6 +556,33 @@ pub fn drc(p: &Project, nl: &Netlist) -> (Vec<Issue>, PcbConn) {
         if let Some(l) = z.layer {
             for (i, t) in p.tracks.iter().enumerate() {
                 if t.layer == l && (inside(t.a) || inside(t.b)) {
+                    uf.union(z0 + zi, t0 + i);
+                }
+            }
+        }
+    }
+    // Drawn zones: vias and tracks inside join the zone only when they carry no other net.
+    for (zi, z) in p.zones.iter().enumerate().filter(|(_, z)| z.drawn) {
+        let Some(zn) = nl.find(&z.net) else { continue };
+        let mut root_nets: HashMap<usize, BTreeSet<usize>> = HashMap::new();
+        for (k, pad) in pads.iter().enumerate() {
+            if let Some(n) = pad.net {
+                let r = uf.find(k);
+                root_nets.entry(r).or_default().insert(n);
+            }
+        }
+        let free = |uf: &mut Uf, item: usize| {
+            let r = uf.find(item);
+            root_nets.get(&r).map_or(true, |s| s.iter().all(|n| *n == zn))
+        };
+        for (i, v) in p.vias.iter().enumerate() {
+            if z.contains(v.pos) && free(&mut uf, np + nt + i) {
+                uf.union(z0 + zi, np + nt + i);
+            }
+        }
+        if let Some(l) = z.layer {
+            for (i, t) in p.tracks.iter().enumerate() {
+                if t.layer == l && (z.contains(t.a) || z.contains(t.b)) && free(&mut uf, t0 + i) {
                     uf.union(z0 + zi, t0 + i);
                 }
             }

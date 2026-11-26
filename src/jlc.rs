@@ -218,6 +218,10 @@ impl Gerber {
         }
         let _ = writeln!(self.body, "X{}Y{}D03*", gx(pos.0), gy(pos.1));
     }
+    /// Dark (copper) or clear (carves what was drawn before) polarity.
+    fn polarity(&mut self, dark: bool) {
+        let _ = writeln!(self.body, "%LP{}*%", if dark { 'D' } else { 'C' });
+    }
     fn region(&mut self, pts: &[(f32, f32)]) {
         if pts.len() < 3 {
             return;
@@ -248,9 +252,12 @@ impl Gerber {
 
 fn drill_of(pad: &crate::checks::PadItem, p: &Project) -> f32 {
     let c = &p.components[pad.ci];
-    let given = c.custom.as_ref().and_then(|cu| {
+    if pad.drill > 0.0 {
+        return pad.drill;
+    }
+    let given = c.fp_geom().and_then(|(pads, _, _)| {
         let num = &c.info().pins[pad.pi].pad;
-        cu.pads.iter().find(|x| &x.number == num).map(|x| x.drill)
+        pads.iter().find(|x| &x.number == num).map(|x| x.drill)
     });
     match given {
         Some(d) if d > 0.0 => d,
@@ -274,12 +281,12 @@ fn silk_lines(p: &Project) -> Vec<((f32, f32), (f32, f32))> {
                 v.push((xf((cx + r * a0.cos(), cy + r * a0.sin())), xf((cx + r * a1.cos(), cy + r * a1.sin()))));
             }
         };
-        match c.custom.as_ref().filter(|cu| !cu.pads.is_empty()) {
-            Some(cu) => {
-                for (a, b) in &cu.silk {
+        match c.fp_geom() {
+            Some((_, silk, circles)) => {
+                for (a, b) in silk {
                     v.push((xf(*a), xf(*b)));
                 }
-                for &(x, y, r) in &cu.silk_circles {
+                for &(x, y, r) in circles {
                     circle(x, y, r, &mut v);
                 }
             }
@@ -376,8 +383,28 @@ pub fn export(p: &Project, conn: &PcbConn, dir: &Path) -> Result<Export, String>
     let mut b_mask = Gerber::new();
     let mut f_paste = Gerber::new();
     let mut lost = 0;
+    let nl = build_netlist(p);
     for z in &p.zones {
         match z.layer.and_then(idx) {
+            Some(i) if z.drawn => {
+                // Zone drawn in FerrisCad: pour it, then carve the clearance around every other net.
+                let (zn, l, clr) = (nl.find(&z.net), z.layer.unwrap(), p.board.clearance);
+                z.outlines.iter().for_each(|poly| copper[i].region(poly));
+                copper[i].polarity(false);
+                for pad in conn.pads.iter().filter(|pd| pd.on(l) && (zn.is_none() || pd.net != zn)) {
+                    copper[i].pad(pad.pos, pad.size, pad.round, clr);
+                }
+                for (ti, t) in p.tracks.iter().enumerate().filter(|(ti, t)| t.layer == l && (zn.is_none() || conn.track_net(*ti) != zn)) {
+                    let _ = ti;
+                    copper[i].line(t.a, t.b, t.width + 2.0 * clr);
+                }
+                for (vi, v) in p.vias.iter().enumerate().filter(|(vi, _)| zn.is_none() || conn.via_net(*vi) != zn) {
+                    let _ = vi;
+                    copper[i].pad(v.pos, (v.size, v.size), true, clr);
+                }
+                copper[i].polarity(true);
+                notes.push(format!("Zone on {} ({}) is poured with {} mm clearance around other nets; thermal reliefs aren't generated.", l.name(), z.net, clr));
+            }
             Some(i) => z.polys.iter().for_each(|poly| copper[i].region(poly)),
             None => lost += 1,
         }
@@ -424,7 +451,33 @@ pub fn export(p: &Project, conn: &PcbConn, dir: &Path) -> Result<Export, String>
     for (a, b) in silk_lines(p) {
         f_silk.line(a, b, 0.15);
     }
-    let b_silk = Gerber::new();
+    let mut b_silk = Gerber::new();
+    // Part references above each footprint, as in the board view.
+    for c in p.components.iter().filter(|c| c.has_fp()) {
+        let bb = c.pcb_bbox();
+        let t = BoardText { text: c.reference.clone(), pos: ((bb.0 + bb.2) / 2.0, bb.1 - 0.8), size: 1.0, rot: 0, layer: TextLayer::SilkFront };
+        for s in crate::font::board_strokes(&t) {
+            for w in s.windows(2) {
+                f_silk.line(w[0], w[1], crate::font::stroke_width(t.size));
+            }
+        }
+    }
+    // Board texts on their layer.
+    for t in &p.texts {
+        let width = crate::font::stroke_width(t.size);
+        let target: Option<&mut Gerber> = match t.layer {
+            TextLayer::SilkFront => Some(&mut f_silk),
+            TextLayer::SilkBack => Some(&mut b_silk),
+            TextLayer::Copper(l) => idx(l).map(|i| &mut copper[i]),
+        };
+        if let Some(g) = target {
+            for s in crate::font::board_strokes(t) {
+                for w in s.windows(2) {
+                    g.line(w[0], w[1], width);
+                }
+            }
+        }
+    }
     let mut edge = Gerber::new();
     let bd = &p.board;
     let k = [(bd.x0, bd.y0), (bd.x1, bd.y0), (bd.x1, bd.y1), (bd.x0, bd.y1)];
@@ -502,7 +555,6 @@ pub fn export(p: &Project, conn: &PcbConn, dir: &Path) -> Result<Export, String>
     let cpl_path = dir.join(format!("{}-CPL.csv", base));
     std::fs::write(&cpl_path, cpl).map_err(|e| e.to_string())?;
     notes.push("Check part rotations in JLCPCB's assembly preview; some packages need a correction there.".into());
-    notes.push("Reference designators aren't printed on the silkscreen yet (only part outlines).".into());
 
     Ok(Export { dir: dir.to_path_buf(), files: vec![zip_path, bom_path, cpl_path], notes })
 }

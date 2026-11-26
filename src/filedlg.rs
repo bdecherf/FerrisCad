@@ -11,6 +11,14 @@ pub enum Purpose {
     Open,
     OpenKicad,
     Save,
+    ExportKicad,
+}
+
+impl Purpose {
+    /// Dialogs that write a file (name box, "Save" button).
+    pub fn saving(self) -> bool {
+        matches!(self, Purpose::Save | Purpose::ExportKicad)
+    }
 }
 
 const KICAD: [&str; 3] = ["kicad_pro", "kicad_sch", "kicad_pcb"];
@@ -28,6 +36,7 @@ pub fn start_native(purpose: Purpose, dir: PathBuf, file_name: String, ctx: egui
         let d = rfd::FileDialog::new().set_directory(&dir);
         let r = match purpose {
             Purpose::Save => d.set_title("Save project").add_filter("FerrisCad project", &["fcad", "vpcb"]).set_file_name(&file_name).save_file(),
+            Purpose::ExportKicad => d.set_title("Export to KiCad").add_filter("KiCad project", &["kicad_pro"]).set_file_name(&file_name).save_file(),
             Purpose::OpenKicad => d
                 .set_title("Open a KiCad project")
                 .add_filter("KiCad project", &KICAD)
@@ -136,7 +145,7 @@ impl Browser {
                         "Folder"
                     } else {
                         match kind_of(&path) {
-                            Some(k) if self.purpose != Purpose::Save || k == "FerrisCad project" => k,
+                            Some(k) if !self.purpose.saving() || (self.purpose == Purpose::Save && k == "FerrisCad project") || (self.purpose == Purpose::ExportKicad && k.starts_with("KiCad")) => k,
                             _ => continue,
                         }
                     };
@@ -160,6 +169,7 @@ impl Browser {
             Purpose::Open => "Open a project",
             Purpose::OpenKicad => "Open a KiCad project",
             Purpose::Save => "Save project",
+            Purpose::ExportKicad => "Export to KiCad",
         };
         let accent = Color32::from_rgb(40, 90, 170);
         egui::Window::new(title)
@@ -204,7 +214,7 @@ impl Browser {
                                 nav = Some(p);
                             }
                         }
-                        if self.purpose != Purpose::Save && !recent.is_empty() {
+                        if !self.purpose.saving() && !recent.is_empty() {
                             ui.add_space(8.0);
                             ui.label(RichText::new("RECENT").small().strong().color(Color32::GRAY));
                             egui::ScrollArea::vertical().id_salt("recent").show(ui, |ui| {
@@ -245,7 +255,7 @@ impl Browser {
                                 let r = ui.add(egui::SelectableLabel::new(sel, txt));
                                 if r.clicked() {
                                     self.selected = Some(e.path.clone());
-                                    if !e.is_dir && self.purpose == Purpose::Save {
+                                    if !e.is_dir && self.purpose.saving() {
                                         self.name = e.name.clone();
                                     }
                                 }
@@ -265,7 +275,7 @@ impl Browser {
                 // Bottom bar.
                 ui.horizontal(|ui| {
                     let can;
-                    if self.purpose == Purpose::Save {
+                    if self.purpose.saving() {
                         ui.label("File name");
                         ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(280.0));
                         can = !self.name.trim().is_empty();
@@ -283,11 +293,11 @@ impl Browser {
                         can = self.selected.as_ref().map_or(here_kicad, |p| p.is_file() || sel_dir_kicad);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let label = if self.purpose == Purpose::Save { "Save" } else { "Open" };
+                        let label = if self.purpose.saving() { "Save" } else { "Open" };
                         let b = egui::Button::new(RichText::new(label).color(Color32::WHITE).strong()).fill(accent).min_size(Vec2::new(90.0, 26.0));
                         if ui.add_enabled(can, b).clicked() {
                             out = match self.purpose {
-                                Purpose::Save => Outcome::Pick(self.dir.join(self.name.trim())),
+                                Purpose::Save | Purpose::ExportKicad => Outcome::Pick(self.dir.join(self.name.trim())),
                                 _ => Outcome::Pick(self.selected.clone().unwrap_or_else(|| self.dir.clone())),
                             };
                         }
@@ -305,6 +315,59 @@ impl Browser {
         }
         out
     }
+}
+
+/// The desktop's file dialog (xdg "document portal") may hand back a path such as
+/// `/run/user/1000/doc/ab12cd/board.kicad_pro`, which gives access to that one file only:
+/// files written next to it never appear in the real folder. This finds the real path.
+pub fn is_portal_path(p: &Path) -> bool {
+    let s = p.to_string_lossy();
+    s.starts_with("/run/user/") && s.contains("/doc/")
+}
+
+#[cfg(target_os = "linux")]
+fn portal_host_path(p: &Path) -> Option<PathBuf> {
+    use std::ffi::{CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    extern "C" {
+        fn getxattr(path: *const std::os::raw::c_char, name: *const std::os::raw::c_char, value: *mut std::os::raw::c_void, size: usize) -> isize;
+    }
+    let c = CString::new(p.as_os_str().as_bytes()).ok()?;
+    let name = CString::new("user.document-portal.host-path").ok()?;
+    let mut buf = vec![0u8; 4096];
+    // SAFETY: valid C strings and a buffer of the given size.
+    let n = unsafe { getxattr(c.as_ptr(), name.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len()) };
+    if n <= 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
+    let host = PathBuf::from(OsStr::from_bytes(&buf));
+    host.is_absolute().then_some(host)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn portal_host_path(_p: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// The real location of a path chosen in a file dialog (unchanged if it already is real).
+pub fn host_path(p: &Path) -> PathBuf {
+    if !is_portal_path(p) {
+        return p.to_path_buf();
+    }
+    if let Some(h) = portal_host_path(p) {
+        return h;
+    }
+    // A file chosen in a save dialog may not exist yet: its folder may still be known.
+    if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+        if let Some(h) = portal_host_path(parent) {
+            return if h.is_dir() { h.join(name) } else { h.with_file_name(name) };
+        }
+    }
+    p.to_path_buf()
 }
 
 /// Ask the system for a folder, on another thread.

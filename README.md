@@ -13,8 +13,13 @@ FerrisCad checks your circuit while you draw it (wiring rules, board rules and a
 ## Features
 
 ### Design
-- **Schematic editor**: built-in parts (resistors, capacitors, diodes, LEDs, transistors, MOSFETs, op-amps, regulators, microcontroller, battery, switch, connectors, power symbols), wires, net labels, rotate, duplicate, undo/redo.
-- **Board layout**: footprints, 45° track routing, vias, ratsnest, board outline, **2 to 16 copper layers** with per-layer visibility.
+- **Schematic editor**: built-in parts (resistors, capacitors, diodes, LEDs, transistors, MOSFETs, op-amps, regulators, microcontroller, battery, switch, connectors, power symbols), wires, net labels, rotate, duplicate, undo/redo, and a **No connect** tool (Q) to mark a pin left open on purpose.
+- **Schematic annotations**: **Line** (I) to separate the sections of a circuit, **Text box** (B) to frame a section or write notes, and **Text** (T) for titles. Choose colour, text size, dashed or filled; drag the handles to resize. They never connect anything, are read by the AI assistant, and are imported from and exported to KiCad.
+- **Board layout**: footprints, 45° track routing, vias, ratsnest, board outline, **2 to 16 copper layers** with per-layer visibility, filled copper zones.
+- **Copper zones**: draw a pour with the **Copper zone** tool (Z): click the corners, double-click or Enter closes it. Pick its net and layer, drag corners or the whole zone, double-click an edge to add a corner, right-click a corner to remove it. Zones imported from KiCad are shown with their outline and net. Zones you draw join their own net in the checks, and the Gerbers carve the board clearance around every other net (KiCad recalculates the exact fill with B).
+- **Footprint picker**: select a part, then *Change…* next to *Footprint* in the properties panel. Pick a common package (0402, 0603, SOIC-8, TO-92…), type a `Library:Name` from the KiCad libraries, browse the libraries, or give the path of a `.kicad_mod` file. Pads are matched to the part's pins by number; *Back to the original footprint* undoes it. The choice is saved with the project and goes to the Gerbers and the KiCad export.
+- **Reusable blocks** (Edit › Blocks…): select the parts of a circuit (say an nRF52840 with its decoupling), save them as a block, and insert it in any project later. The block carries its schematic (wires, labels, power symbols) and its layout (placement, tracks, vias, zones, texts). An inserted block is an independent copy you can edit freely; references are renumbered and the block arrives selected, ready to drag into place. **Edit** opens a saved block in the editor (schematic, board, checks, everything) while your project is put aside; *Save block* writes it back (a new name saves a new block), *Close* brings your project back untouched.
+- **Board text**: write text on the front or back silkscreen or on any copper layer (back-side text is mirrored automatically). Part references are printed on the silkscreen too.
 - **3D view**: board, pads, tracks, silkscreen and simple 3D bodies for every part; orbit, zoom and pan with the mouse.
 - **Multiple selection**: box selection, Shift/Ctrl+click and Ctrl+A. Moving a group keeps wires and tracks connected.
 
@@ -31,6 +36,7 @@ FerrisCad checks your circuit while you draw it (wiring rules, board rules and a
 
 ### Parts and manufacturing
 - **KiCad import** (KiCad 6 to 9): hierarchical sheets, symbols, wires and labels, footprints, tracks, vias, zones, inner layers, board outline, LCSC/JLCPCB part numbers.
+- **KiCad export** (File › Export to KiCad…): writes `.kicad_pro`, `.kicad_sch` and `.kicad_pcb` (KiCad 8 format, opened by KiCad 8 and 9) with symbols, wires, labels, footprints, pads, tracks, vias, zones, layers and part numbers, plus a `FerrisCad` symbol library, footprint library (`FerrisCad.pretty`) and the library tables, so KiCad's ERC/DRC and netlist see exactly the connections drawn in FerrisCad. Wires are split at pins, labels and junctions, as KiCad requires.
 - **Online KiCad library**: search the official KiCad symbol libraries and add a part with its real symbol and footprint (cached locally).
 - **JLCPCB**: search their parts catalogue (stock, price, Basic/Extended), fill part numbers automatically, and generate **Gerbers + drill (ZIP), BOM and placement (CPL)** in their format, then open their order page.
 
@@ -87,10 +93,12 @@ On first start, FerrisCad uses **Claude Code** automatically if it is installed 
 | Edit a value | Double-click the part |
 | Select several items | Drag on empty space · Shift/Ctrl+click · Ctrl+A |
 | Route a track | X, click a pad, click to bend, click the target pad |
+| Write text on the board | T (or "Add text" in the left panel), type the text, pick the layer and size, click on the board |
 | Change layer while routing | PageUp / PageDown (drops a via) · V |
 | Zoom / pan | Mouse wheel · right- or middle-drag |
 | Undo / redo | Ctrl+Z / Ctrl+Y |
 | Open / save | Ctrl+O / Ctrl+S (projects are `.fcad` files; KiCad projects open directly) |
+| Reload the open file | Ctrl+R or F5. FerrisCad also notices when the file is changed by another program (e.g. Claude) and reloads it, or asks first if you have unsaved edits |
 
 ---
 
@@ -119,9 +127,9 @@ packaging/      AppImage files and build script
 ```
 
 ## Known limitations
-- 3D parts are simple shapes, not manufacturer 3D models; copper zones aren't drawn in 3D.
-- Changes are saved in FerrisCad's own format; they aren't written back into KiCad files.
-- Reference designators aren't printed on the silkscreen yet (only part outlines).
+- 3D parts are simple shapes, not manufacturer 3D models.
+- KiCad export writes a new, single-sheet project (sub-sheets are flattened); each part gets its own symbol drawn as in FerrisCad rather than a link to KiCad's standard libraries.
+- Board text uses FerrisCad's built-in single-line font (KiCad files keep the text, but KiCad redraws it with its own font).
 - The JLCPCB part search uses their public website catalogue, which may change without notice. JLCPCB doesn't allow other apps to place orders, so you upload the generated files on their site.
 - The DC simulation doesn't know what your microcontroller firmware does, and doesn't simulate over time (no transient analysis yet).
 

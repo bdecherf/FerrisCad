@@ -58,6 +58,7 @@ quelques millisecondes, ce qui évite toute logique de mise à jour incrémental
 | `src/aiedit.rs` | Exécution des modifications proposées par l’IA (ajouter, relier, placer, router…). |
 | `src/multisel.rs` | Sélection multiple : Maj/Ctrl+clic, cadre de sélection, Ctrl+A, déplacement et suppression en groupe (les fils et pistes attachés suivent). |
 | `src/online.rs` | Bibliothèque en ligne : recherche et téléchargement des symboles et empreintes officiels KiCad. |
+| `src/font.rs` | Police filaire (traits simples) des textes de carte : le texte affiché est exactement celui qui part dans les Gerbers. |
 | `src/kicad.rs` | Import de projets KiCad 6 à 9 (`.kicad_pro`, `.kicad_sch`, `.kicad_pcb`) : lecteur S-expressions, feuilles hiérarchiques, zones, règles. |
 | `.cargo/config.toml`, `tools/host-*.sh` | Édition de liens via le compilateur de l'hôte quand la compilation tourne dans un bac à sable Flatpak sans compilateur C. |
 | `packaging/` | Fichiers de l'AppImage (`AppRun`, `.desktop`, icône) et script `build-appimage.sh`. |
@@ -304,6 +305,54 @@ couleur) dessinés comme un maillage egui.
    masqués par la plaque.
 
 Limites : pas de modèles STEP/VRML, zones de cuivre et couches internes non affichées.
+
+---
+
+## 7 sexies. Rechargement du fichier (`reload.rs`)
+
+Le fichier d'origine (projet `.fcad` ou projet KiCad) est surveillé toutes les secondes :
+pour KiCad, la date la plus récente des fichiers `.kicad_sch`, `.kicad_pcb` et `.kicad_pro`
+du dossier (hors sauvegardes automatiques). S'il change sur le disque (par exemple modifié
+par Claude) et qu'aucune modification n'a été faite dans FerrisCad depuis le chargement, le
+projet est rechargé automatiquement ; sinon un bandeau propose « Reload from disk » ou
+« Keep my version ». Fichier › Reload from disk, Ctrl+R ou F5 rechargent à la demande.
+Chaque rechargement est une étape d'annulation (Ctrl+Z revient à la version précédente).
+
+---
+
+## 7 septies. Export KiCad (`kicad_export.rs`)
+
+Fichier › Export to KiCad… écrit un projet KiCad 8 (ouvert aussi par KiCad 9) :
+
+- **`.kicad_sch`** : une seule feuille (les sous-feuilles importées sont mises à plat),
+  format de page choisi selon la taille du schéma. Chaque pièce a son propre symbole dans
+  la bibliothèque intégrée du fichier, dessiné exactement comme dans FerrisCad : les
+  symboles intégrés sont « enregistrés » par le code de dessin (`sch::record_builtin`,
+  mode enregistrement de `Sym`), les pièces importées utilisent leur géométrie. Broches de
+  longueur 0 (leurs pattes font partie du dessin), symboles d'alimentation `(power)`,
+  fils, labels, jonctions, marques « non connecté », propriétés `LCSC` et
+  `FerrisCad_Kind` (qui permet de retrouver le type de pièce à la réouverture).
+- **`.kicad_pcb`** : table des couches (F.Cu, In1.Cu… B.Cu), nets, empreintes avec
+  pastilles (CMS / traversantes, perçage), sérigraphie, pistes, vias, zones remplies,
+  contour `Edge.Cuts`. La carte est décalée si elle touche le coin de la page.
+- **`.kicad_pro`** : classe de nets par défaut avec la règle d'isolement.
+
+Test d'aller-retour (`--kicad-roundtrip`) : export puis ré-import par l'importeur KiCad
+de FerrisCad, comparaison de toutes les connexions, des pistes, vias, couches et textes.
+
+---
+
+## 7 octies. Textes sur la carte (`font.rs`)
+
+- **Modèle** : `BoardText { text, pos, size, rot, layer }` dans `Project::texts`, avec
+  `TextLayer` = sérigraphie avant, sérigraphie arrière ou une couche cuivre.
+- **Police** : chaque caractère est une suite de traits sur une grille 4 × 6 (minuscules
+  avec jambages jusqu'à 8), espacement proportionnel. `layout()` centre le texte,
+  `board_strokes()` le tourne par quarts de tour et le retourne en miroir sur la face arrière,
+  `stroke_width()` donne l'épaisseur du trait (15 % de la hauteur).
+- **Usages** : dessin à l'écran (`pcb.rs`, outil T), vue 3D, Gerbers (`jlc.rs` : textes et
+  repères des composants en sérigraphie), export/import KiCad (`gr_text`, avec
+  `justify mirror` sur l'arrière).
 
 ---
 

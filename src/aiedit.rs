@@ -121,6 +121,7 @@ impl App {
             pcb_rot: 0,
             custom: custom.map(|c| Box::new(c.clone())),
             lcsc: String::new(),
+            fp_over: None,
         };
         let mut pos = start;
         for _ in 0..60 {
@@ -318,7 +319,9 @@ impl App {
                     let c = &self.project.components[ci];
                     c.info().pins.iter().map(|p| c.pin_pos(p)).collect()
                 };
+                let marks = self.nc_marks(&[self.project.components[ci].id].into());
                 self.project.components[ci].pos = (snap(xy.0), snap(xy.1));
+                self.place_nc_marks(&marks);
                 let c = self.project.components[ci].clone();
                 let new: Vec<(i32, i32)> = c.info().pins.iter().map(|p| c.pin_pos(p)).collect();
                 for w in self.project.wires.iter_mut() {
@@ -335,8 +338,10 @@ impl App {
             }
             "ROTATE" => {
                 let ci = self.project.find_ref(a.arg(0)).ok_or(format!("There is no part called {}.", a.arg(0)))?;
-                let c = &mut self.project.components[ci];
-                c.rot = (c.rot + 1) % 4;
+                let marks = self.nc_marks(&[self.project.components[ci].id].into());
+                self.project.components[ci].rot = (self.project.components[ci].rot + 1) % 4;
+                self.place_nc_marks(&marks);
+                let c = &self.project.components[ci];
                 Ok(format!("rotated {}", c.reference))
             }
             "PLACE" => {

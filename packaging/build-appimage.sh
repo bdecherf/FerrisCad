@@ -23,9 +23,10 @@ cp "$PKG/AppRun" "$DIR/AppRun"
 chmod +x "$DIR/AppRun"
 cp "$PKG/ferriscad.desktop" "$DIR/"
 cp "$PKG/ferriscad.desktop" "$DIR/usr/share/applications/"
-cp "$PKG/ferriscad.svg" "$DIR/"
+# Icon: PNG at the top (AppImage requirement), SVG for the desktop's icon theme.
+cp "$PKG/ferriscad.png" "$DIR/"
 cp "$PKG/ferriscad.svg" "$DIR/usr/share/icons/hicolor/scalable/apps/"
-ln -s ferriscad.svg "$DIR/.DirIcon"
+ln -s ferriscad.png "$DIR/.DirIcon"
 
 echo "== 3/3 AppImage"
 TOOL="$TOOLS/appimagetool-$ARCH.AppImage"
@@ -38,5 +39,8 @@ if [ ! -x "$TOOL" ]; then
 fi
 mkdir -p "$OUT"
 # APPIMAGE_EXTRACT_AND_RUN lets the tool run without FUSE.
-APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$ARCH" "$TOOL" --no-appstream "$DIR" "$OUT/FerrisCad-$ARCH.AppImage"
+# Build next to the old file and swap it in: this works even while FerrisCad is running
+# (a running program's file can't be overwritten in place).
+APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$ARCH" "$TOOL" --no-appstream "$DIR" "$OUT/FerrisCad-$ARCH.AppImage.new"
+mv -f "$OUT/FerrisCad-$ARCH.AppImage.new" "$OUT/FerrisCad-$ARCH.AppImage"
 echo "Done: $OUT/FerrisCad-$ARCH.AppImage"

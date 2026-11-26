@@ -48,12 +48,124 @@ pub fn route45(from: (f32, f32), to: (f32, f32)) -> Vec<(f32, f32)> {
     vec![mid, to]
 }
 
+fn active_layer(app: &App) -> Layer {
+    app.route_layer
+}
+
+pub type ZoneTris = Vec<(Option<Layer>, Vec<[(f32, f32); 3]>)>;
+
+fn is_convex(poly: &[(f32, f32)]) -> bool {
+    let n = poly.len();
+    if n < 3 {
+        return false;
+    }
+    let mut sign = 0.0f32;
+    for i in 0..n {
+        let (a, b, c) = (poly[i], poly[(i + 1) % n], poly[(i + 2) % n]);
+        let cross = (b.0 - a.0) * (c.1 - b.1) - (b.1 - a.1) * (c.0 - b.0);
+        if cross.abs() < 1e-9 {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if cross.signum() != sign {
+            return false;
+        }
+    }
+    true
+}
+
+/// Fill any polygon (concave, or with holes joined by cut lines as KiCad saves zones) with
+/// thin horizontal strips, using the even-odd rule.
+fn scan_fill(poly: &[(f32, f32)], out: &mut Vec<[(f32, f32); 3]>) {
+    let (y0, y1) = poly.iter().fold((f32::MAX, f32::MIN), |m, p| (m.0.min(p.1), m.1.max(p.1)));
+    let step = 0.05f32;
+    let n = poly.len();
+    let mut y = y0;
+    while y < y1 {
+        let yc = y + step / 2.0;
+        let mut xs: Vec<f32> = vec![];
+        for i in 0..n {
+            let (a, b) = (poly[i], poly[(i + 1) % n]);
+            if (a.1 > yc) != (b.1 > yc) {
+                xs.push(a.0 + (yc - a.1) / (b.1 - a.1) * (b.0 - a.0));
+            }
+        }
+        xs.sort_by(|p, q| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal));
+        let ytop = (y + step).min(y1);
+        for pair in xs.chunks(2) {
+            if let [xa, xb] = pair {
+                if xb - xa > 1e-4 {
+                    out.push([(*xa, y), (*xb, y), (*xb, ytop)]);
+                    out.push([(*xa, y), (*xb, ytop), (*xa, ytop)]);
+                }
+            }
+        }
+        y += step;
+    }
+}
+
+/// Triangles filling every copper zone, computed once per zone change.
+fn zone_fill(app: &mut App) -> std::sync::Arc<ZoneTris> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    app.project.zones.len().hash(&mut h);
+    for z in &app.project.zones {
+        z.layer.hash(&mut h);
+        z.polys.len().hash(&mut h);
+        for p in &z.polys {
+            p.len().hash(&mut h);
+            for q in p.iter().step_by((p.len() / 8).max(1)) {
+                q.0.to_bits().hash(&mut h);
+                q.1.to_bits().hash(&mut h);
+            }
+        }
+    }
+    let key = h.finish();
+    if let Some((k, tris)) = &app.zone_cache {
+        if *k == key {
+            return tris.clone();
+        }
+    }
+    let mut v: ZoneTris = vec![];
+    for z in &app.project.zones {
+        let mut tris = vec![];
+        for poly in &z.polys {
+            if poly.len() < 3 {
+                continue;
+            }
+            if is_convex(poly) {
+                for i in 1..poly.len() - 1 {
+                    tris.push([poly[0], poly[i], poly[i + 1]]);
+                }
+            } else {
+                scan_fill(poly, &mut tris);
+            }
+        }
+        v.push((z.layer, tris));
+    }
+    let arc = std::sync::Arc::new(v);
+    app.zone_cache = Some((key, arc.clone()));
+    arc
+}
+
+/// Zone triangles for other views (3D).
+pub fn zone_triangles(app: &mut App) -> std::sync::Arc<ZoneTris> {
+    zone_fill(app)
+}
+
 impl App {
     fn pad_at(&self, w: (f32, f32)) -> Option<usize> {
         self.conn.pads.iter().position(|p| p.contains(w))
     }
 
     fn pcb_hit(&self, w: (f32, f32), tol: f32) -> Sel {
+        for (i, t) in self.project.texts.iter().enumerate().rev() {
+            let b = crate::font::bbox(t);
+            if w.0 >= b.0 - tol && w.0 <= b.2 + tol && w.1 >= b.1 - tol && w.1 <= b.3 + tol {
+                return Sel::Text(i);
+            }
+        }
         for (i, v) in self.project.vias.iter().enumerate() {
             if ((w.0 - v.pos.0).powi(2) + (w.1 - v.pos.1).powi(2)).sqrt() <= v.size / 2.0 + tol {
                 return Sel::Via(i);
@@ -64,13 +176,132 @@ impl App {
                 return Sel::Track(i);
             }
         }
+        // Zone outlines (their edge), before the footprints that may sit on top of them.
+        for (i, z) in self.project.zones.iter().enumerate().rev() {
+            if z.layer.map_or(false, |l| self.hidden_layers.contains(&l)) {
+                continue;
+            }
+            for o in &z.outlines {
+                if (0..o.len()).any(|k| dist_pt_seg(w, o[k], o[(k + 1) % o.len()]) <= tol) {
+                    return Sel::Zone(i);
+                }
+            }
+        }
         for c in self.project.components.iter().rev().filter(|c| c.has_fp()) {
             let b = c.pcb_bbox();
             if w.0 >= b.0 && w.0 <= b.2 && w.1 >= b.1 && w.1 <= b.3 {
                 return Sel::Comp(c.id);
             }
         }
+        // Inside a zone: the active layer's zones first.
+        let active = active_layer(self);
+        for on_active in [true, false] {
+            for (i, z) in self.project.zones.iter().enumerate().rev() {
+                let shown = z.layer.map_or(true, |l| !self.hidden_layers.contains(&l));
+                if shown && (z.layer == Some(active)) == on_active && z.contains(w) {
+                    return Sel::Zone(i);
+                }
+            }
+        }
         Sel::None
+    }
+
+    /// The outline corner of zone `zi` within `r` of `w`: (outline, vertex).
+    fn zone_vertex_at(&self, zi: usize, w: (f32, f32), r: f32) -> Option<(usize, usize)> {
+        let z = self.project.zones.get(zi)?;
+        for (oi, o) in z.outlines.iter().enumerate() {
+            for (vi, q) in o.iter().enumerate() {
+                if ((q.0 - w.0).powi(2) + (q.1 - w.1).powi(2)).sqrt() <= r {
+                    return Some((oi, vi));
+                }
+            }
+        }
+        None
+    }
+
+    /// Close the zone being drawn.
+    pub fn finish_zone(&mut self) {
+        let pts = std::mem::take(&mut self.zone_draft);
+        if pts.len() < 3 {
+            self.status = "A zone needs at least 3 corners.".into();
+            return;
+        }
+        self.checkpoint();
+        let layer = self.route_layer;
+        self.project.zones.push(Zone::new(layer, &self.zone_net.clone(), pts));
+        self.sel = Sel::Zone(self.project.zones.len() - 1);
+        self.group.clear();
+        self.pcb_tool = PcbTool::Select;
+        self.status = format!(
+            "Zone on {} ({}) created. Drag its corners, double-click an edge to add one. KiCad recomputes the real fill with clearances (B).",
+            layer.name(),
+            self.zone_net
+        );
+    }
+
+    pub fn zone_properties(&mut self, ui: &mut egui::Ui, i: usize) {
+        ui.label(egui::RichText::new("Copper zone").strong().size(15.0));
+        let Some(z) = self.project.zones.get(i).cloned() else { return };
+        let mut names: Vec<String> = self.nl.nets.iter().filter(|n| !n.pins.is_empty()).map(|n| n.name.clone()).collect();
+        names.sort();
+        names.dedup();
+        let mut net = z.net.clone();
+        ui.horizontal(|ui| {
+            ui.label("Net");
+            egui::ComboBox::from_id_salt("zone_net_sel").selected_text(if net.is_empty() { "(none)".to_string() } else { net.clone() }).show_ui(ui, |ui| {
+                ui.selectable_value(&mut net, String::new(), "(none)");
+                for n in &names {
+                    ui.selectable_value(&mut net, n.clone(), n);
+                }
+            });
+        });
+        let mut layer = z.layer;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Layer");
+            for l in self.project.board.copper() {
+                if ui.selectable_label(layer == Some(l), l.short()).clicked() {
+                    layer = Some(l);
+                }
+            }
+        });
+        if net != z.net || layer != z.layer {
+            self.checkpoint();
+            let zz = &mut self.project.zones[i];
+            zz.net = net;
+            zz.layer = layer;
+            if !zz.outlines.is_empty() {
+                zz.outline_changed();
+            }
+        }
+        let area: f32 = z
+            .outlines
+            .iter()
+            .map(|o| (0..o.len()).map(|k| o[k].0 * o[(k + 1) % o.len()].1 - o[(k + 1) % o.len()].0 * o[k].1).sum::<f32>().abs() / 2.0)
+            .sum();
+        if z.outlines.is_empty() {
+            ui.label(egui::RichText::new("Filled copper imported from KiCad (the outline wasn't kept).").small().color(Color32::GRAY));
+            if ui.button("Redraw as the board outline").on_hover_text("Replaces the fill by a zone covering the whole board").clicked() {
+                self.checkpoint();
+                let b = self.project.board.clone();
+                let zz = &mut self.project.zones[i];
+                zz.outlines = vec![vec![(b.x0, b.y0), (b.x1, b.y0), (b.x1, b.y1), (b.x0, b.y1)]];
+                zz.outline_changed();
+            }
+        } else {
+            ui.label(format!("{} corners, {:.0} mm²", z.outlines.iter().map(|o| o.len()).sum::<usize>(), area));
+            ui.label(
+                egui::RichText::new(if z.drawn {
+                    "Drag a corner to move it, drag the zone to move it, double-click an edge to add a corner, right-click a corner to remove it. The fill is the plain outline here: other nets are kept clear in KiCad (B) and in the Gerbers."
+                } else {
+                    "Filled by KiCad. Editing the outline replaces that fill by the plain outline."
+                })
+                .small()
+                .color(Color32::GRAY),
+            );
+        }
+        if ui.button("🗑 Delete zone").clicked() {
+            self.delete_selection();
+        }
     }
 
     fn route_click(&mut self, w: (f32, f32)) {
@@ -130,6 +361,10 @@ impl App {
     }
 
     fn pcb_hover_info(&self, w: (f32, f32), tol: f32) -> String {
+        if let Sel::Text(i) = self.pcb_hit(w, tol) {
+            let t = &self.project.texts[i];
+            return format!("Text \"{}\" · {} · {} mm", t.text, t.layer.name(), t.size);
+        }
         if let Some(k) = self.pad_at(w) {
             let pad = &self.conn.pads[k];
             let c = &self.project.components[pad.ci];
@@ -194,9 +429,22 @@ impl App {
                             .map(|c| (c.id, c.pcb_pos));
                         let in_group = !self.group.is_empty()
                             && (self.is_sel(hit) || comp_hit.map_or(false, |(id, _)| self.is_sel(Sel::Comp(id))));
-                        if in_group {
+                        let zone_corner = match self.sel {
+                            Sel::Zone(zi) if self.group.is_empty() => self.zone_vertex_at(zi, w, tol * 2.0).map(|(oi, vi)| (zi, oi, vi)),
+                            _ => None,
+                        };
+                        let zone_hit = matches!(hit, Sel::Zone(_)) && hit == self.sel && comp_hit.is_none();
+                        if let Some((zi, oi, vi)) = zone_corner {
+                            self.checkpoint();
+                            self.drag = Some(Drag::ZoneVertex { zi, oi, vi });
+                        } else if zone_hit {
+                            if let Sel::Zone(zi) = hit {
+                                self.checkpoint();
+                                self.drag = Some(Drag::ZoneMove { zi, start: snap_p(w), orig: self.project.zones[zi].outlines.clone() });
+                            }
+                        } else if in_group {
                             self.start_pcb_group_drag(snap_p(w));
-                        } else if additive || (hit == Sel::None && comp_hit.is_none()) {
+                        } else if additive || ((hit == Sel::None || matches!(hit, Sel::Zone(_))) && comp_hit.is_none()) {
                             self.drag = Some(Drag::Band { start: w, cur: w, add: additive });
                         } else if let Some((id, orig)) = comp_hit {
                             self.group.clear();
@@ -207,7 +455,7 @@ impl App {
                         } else {
                             self.group.clear();
                             self.sel = hit;
-                            if matches!(hit, Sel::Track(_) | Sel::Via(_)) {
+                            if matches!(hit, Sel::Track(_) | Sel::Via(_) | Sel::Text(_)) {
                                 self.start_pcb_group_drag(snap_p(w));
                             }
                         }
@@ -218,6 +466,23 @@ impl App {
                         match d {
                             Drag::Band { start, add, .. } => self.drag = Some(Drag::Band { start, cur: w, add }),
                             Drag::PcbGroup { .. } => self.drag_pcb_group(&d, snap_p(w)),
+                            Drag::ZoneVertex { zi, oi, vi } => {
+                                if let Some(q) = self.project.zones.get_mut(zi).and_then(|z| z.outlines.get_mut(oi)).and_then(|o| o.get_mut(vi)) {
+                                    *q = snap_p(w);
+                                }
+                                if let Some(z) = self.project.zones.get_mut(zi) {
+                                    z.outline_changed();
+                                }
+                                self.analysis_dirty = true;
+                            }
+                            Drag::ZoneMove { zi, start, orig } => {
+                                let s = snap_p(w);
+                                if let Some(z) = self.project.zones.get_mut(zi) {
+                                    z.outlines = orig.iter().map(|o| o.iter().map(|q| (q.0 + s.0 - start.0, q.1 + s.1 - start.1)).collect()).collect();
+                                    z.outline_changed();
+                                }
+                                self.analysis_dirty = true;
+                            }
                             Drag::PcbComp { id, start, orig } => {
                                 let s = snap_p(w);
                                 if let Some(ci) = self.project.find(id) {
@@ -281,9 +546,71 @@ impl App {
                     }
                 }
             }
+            PcbTool::Zone => {
+                if resp.clicked() {
+                    if let Some(w) = mouse_w {
+                        let q = snap_p(w);
+                        if self.zone_draft.len() >= 3 && ((q.0 - self.zone_draft[0].0).powi(2) + (q.1 - self.zone_draft[0].1).powi(2)).sqrt() < tol * 2.0 {
+                            self.finish_zone();
+                        } else if self.zone_draft.last() != Some(&q) {
+                            self.zone_draft.push(q);
+                        }
+                    }
+                }
+                if resp.double_clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    self.finish_zone();
+                }
+            }
+            PcbTool::Text => {
+                if resp.clicked() {
+                    if let Some(w) = mouse_w {
+                        let text = self.text_input.trim().to_string();
+                        if text.is_empty() {
+                            self.status = "Type the text first (left panel).".into();
+                        } else {
+                            self.checkpoint();
+                            self.project.texts.push(BoardText { text, pos: snap_p(w), size: self.text_size, rot: 0, layer: self.text_layer });
+                            self.sel = Sel::Text(self.project.texts.len() - 1);
+                            self.group.clear();
+                            self.status = format!("Text placed on {}. Drag it to move it, R to rotate.", self.text_layer.name());
+                        }
+                    }
+                }
+            }
         }
-        if resp.secondary_clicked() && self.pcb_tool != PcbTool::Route {
+        if resp.secondary_clicked() && self.pcb_tool == PcbTool::Zone && !self.zone_draft.is_empty() {
+            // Right-click closes the zone, or drops it when it has fewer than 3 corners.
+            if self.zone_draft.len() >= 3 {
+                self.finish_zone();
+            } else {
+                self.zone_draft.clear();
+            }
+        } else if resp.secondary_clicked() && self.pcb_tool == PcbTool::Select {
+            // Right-click on a corner of the selected zone removes it.
+            if let (Sel::Zone(zi), Some(w)) = (self.sel, mouse_w) {
+                if let Some((oi, vi)) = self.zone_vertex_at(zi, w, tol * 2.0) {
+                    if self.project.zones[zi].outlines[oi].len() > 3 {
+                        self.checkpoint();
+                        self.project.zones[zi].outlines[oi].remove(vi);
+                        self.project.zones[zi].outline_changed();
+                    }
+                }
+            }
+        } else if resp.secondary_clicked() && self.pcb_tool != PcbTool::Route {
             self.pcb_tool = PcbTool::Select;
+        }
+        // Double-click on an edge of the selected zone adds a corner.
+        if self.pcb_tool == PcbTool::Select && resp.double_clicked() {
+            if let (Sel::Zone(zi), Some(w)) = (self.sel, mouse_w) {
+                let found = self.project.zones[zi].outlines.iter().enumerate().find_map(|(oi, o)| {
+                    (0..o.len()).find(|&k| dist_pt_seg(w, o[k], o[(k + 1) % o.len()]) <= tol * 2.0).map(|k| (oi, k))
+                });
+                if let Some((oi, k)) = found {
+                    self.checkpoint();
+                    self.project.zones[zi].outlines[oi].insert(k + 1, snap_p(w));
+                    self.project.zones[zi].outline_changed();
+                }
+            }
         }
 
         // ---- drawing
@@ -308,15 +635,65 @@ impl App {
             }
         }
         painter.rect_stroke(br, 0.0, Stroke::new((0.15 * z).max(1.5), EDGE));
-        // copper zones (outlines)
-        for z in &self.project.zones {
-            if z.layer.map_or(false, |l| self.hidden_layers.contains(&l)) {
+        // copper zones, filled (inactive layers fainter)
+        let zones = zone_fill(self);
+        let mut mesh = egui::epaint::Mesh::default();
+        for (layer, tris) in zones.iter() {
+            if layer.map_or(false, |l| self.hidden_layers.contains(&l)) {
                 continue;
             }
-            let col = z.layer.map(layer_color).unwrap_or(Color32::from_rgb(160, 160, 90)).gamma_multiply(0.35);
-            for poly in &z.polys {
-                let pts: Vec<Pos2> = poly.iter().map(|&q| view.s(min, q)).collect();
-                painter.add(Shape::closed_line(pts, Stroke::new(1.5_f32, col)));
+            let strength = if *layer == Some(active_layer(self)) { 0.45 } else { 0.25 };
+            let col = layer.map(layer_color).unwrap_or(Color32::from_rgb(160, 160, 90)).gamma_multiply(strength);
+            for t in tris {
+                let i = mesh.vertices.len() as u32;
+                for q in t {
+                    mesh.colored_vertex(view.s(min, *q), col);
+                }
+                mesh.add_triangle(i, i + 1, i + 2);
+            }
+            if mesh.vertices.len() > 50_000 {
+                painter.add(Shape::mesh(std::mem::take(&mut mesh)));
+            }
+        }
+        painter.add(Shape::mesh(mesh));
+        // zone outlines, net names, and the corners of the selected zone
+        for (zi, zn) in self.project.zones.iter().enumerate() {
+            if zn.layer.map_or(false, |l| self.hidden_layers.contains(&l)) {
+                continue;
+            }
+            let selected = self.sel == Sel::Zone(zi);
+            let col = if selected { SELECT } else { zn.layer.map(layer_color).unwrap_or(Color32::from_rgb(160, 160, 90)) };
+            for o in &zn.outlines {
+                let mut pts: Vec<Pos2> = o.iter().map(|&q2| view.s(min, q2)).collect();
+                if let Some(f0) = pts.first().copied() {
+                    pts.push(f0);
+                }
+                painter.add(Shape::line(pts, Stroke::new(if selected { 2.0 } else { 1.0 }, col.gamma_multiply(if selected { 1.0 } else { 0.8 }))));
+                if selected {
+                    for &q2 in o {
+                        painter.rect_filled(Rect::from_center_size(view.s(min, q2), Vec2::splat(7.0)), 1.0, SELECT);
+                    }
+                }
+                if !zn.net.is_empty() && z > 3.0 {
+                    let c = (o.iter().map(|q| q.0).sum::<f32>() / o.len() as f32, o.iter().map(|q| q.1).sum::<f32>() / o.len() as f32);
+                    painter.text(view.s(min, c), Align2::CENTER_CENTER, &zn.net, FontId::proportional(11.0), col.gamma_multiply(0.9));
+                }
+            }
+        }
+        if !self.zone_draft.is_empty() {
+            let mut pts: Vec<Pos2> = self.zone_draft.iter().map(|&q2| view.s(min, q2)).collect();
+            if let Some(w) = mouse_w {
+                pts.push(view.s(min, snap_p(w)));
+            }
+            let col = layer_color(self.route_layer);
+            painter.add(Shape::line(pts.clone(), Stroke::new(1.5, col)));
+            if self.zone_draft.len() >= 2 {
+                if let (Some(a), Some(b)) = (pts.last(), pts.first()) {
+                    painter.line_segment([*a, *b], Stroke::new(1.0, col.gamma_multiply(0.5)));
+                }
+            }
+            for (k, &q2) in self.zone_draft.iter().enumerate() {
+                painter.circle_filled(view.s(min, q2), if k == 0 { 5.0 } else { 3.0 }, col);
             }
         }
         // tracks: back to front, the active layer last (on top)
@@ -446,6 +823,29 @@ impl App {
             painter.circle_filled(p, v.size / 2.0 * z, col);
             painter.circle_filled(p, v.size * 0.2 * z, Color32::from_rgb(30, 30, 30));
         }
+        // board texts (silkscreen and copper)
+        for (i, t) in self.project.texts.iter().enumerate() {
+            let col = match t.layer {
+                TextLayer::SilkFront => SILK,
+                TextLayer::SilkBack => SILK.gamma_multiply(0.55),
+                TextLayer::Copper(l) => {
+                    if self.hidden_layers.contains(&l) {
+                        continue;
+                    }
+                    layer_color(l)
+                }
+            };
+            let col = if self.is_sel(Sel::Text(i)) { SELECT } else { col };
+            let wd = (crate::font::stroke_width(t.size) * z).max(1.0);
+            for stroke in crate::font::board_strokes(t) {
+                let pts: Vec<Pos2> = stroke.iter().map(|&q2| view.s(min, q2)).collect();
+                painter.add(Shape::line(pts, Stroke::new(wd, col)));
+            }
+            if self.is_sel(Sel::Text(i)) {
+                let b = crate::font::bbox(t);
+                painter.rect_stroke(Rect::from_two_pos(view.s(min, (b.0, b.1)), view.s(min, (b.2, b.3))), 2.0, Stroke::new(1.0_f32, SELECT.gamma_multiply(0.5)));
+            }
+        }
         // reference text
         for c in self.project.components.iter().filter(|c| c.has_fp()) {
             let fs = (1.0 * z).clamp(7.0, 28.0);
@@ -485,6 +885,16 @@ impl App {
             }
             for v in &r.vias {
                 painter.circle_filled(view.s(min, *v), 0.4 * z, Color32::from_rgb(190, 190, 196));
+            }
+        }
+        if self.pcb_tool == PcbTool::Text && !self.text_input.trim().is_empty() {
+            if let Some(w) = mouse_w {
+                let ghost = BoardText { text: self.text_input.clone(), pos: snap_p(w), size: self.text_size, rot: 0, layer: self.text_layer };
+                let wd = (crate::font::stroke_width(ghost.size) * z).max(1.0);
+                for stroke in crate::font::board_strokes(&ghost) {
+                    let pts: Vec<Pos2> = stroke.iter().map(|&q2| view.s(min, q2)).collect();
+                    painter.add(Shape::line(pts, Stroke::new(wd, SILK.gamma_multiply(0.5))));
+                }
             }
         }
         if self.pcb_tool == PcbTool::Via {

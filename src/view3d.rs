@@ -290,7 +290,7 @@ fn shrink_to_body(pb: &(f32, f32, f32, f32), pads: &[&PadItem]) -> (f32, f32, f3
     }
 }
 
-fn build_scene(app: &App) -> Scene {
+fn build_scene(app: &App, zones: &crate::pcb::ZoneTris) -> Scene {
     let mut sc = Scene::default();
     let p = &app.project;
     let b = &p.board;
@@ -320,6 +320,24 @@ fn build_scene(app: &App) -> Scene {
             }
         }
     }
+    // Copper zones on the outer layers (under the solder mask, like tracks).
+    if cam.show_tracks {
+        let under = Color32::from_rgb(40, 122, 64);
+        for (layer, tris) in zones.iter() {
+            let (z, up) = match layer {
+                Some(Layer::Front) => (BOARD_T + 0.005, true),
+                Some(Layer::Back) => (-0.005, false),
+                _ => continue,
+            };
+            for t in tris {
+                let p: [V3; 3] = [w(t[0].0, t[0].1, z), w(t[1].0, t[1].1, z), w(t[2].0, t[2].1, z)];
+                // Face the viewer whatever the winding of the source polygon.
+                let ccw = (t[1].0 - t[0].0) * (t[2].1 - t[0].1) - (t[1].1 - t[0].1) * (t[2].0 - t[0].0) < 0.0;
+                let p = if ccw == up { p } else { [p[0], p[2], p[1]] };
+                sc.tris.push(Tri { p, n: [0.0, 0.0, if up { 1.0 } else { -1.0 }], c: under });
+            }
+        }
+    }
     // Pads (gold) and holes.
     let gold = Color32::from_rgb(214, 178, 88);
     let hole = Color32::from_rgb(20, 20, 20);
@@ -345,6 +363,25 @@ fn build_scene(app: &App) -> Scene {
         for (z, up) in [(top + 0.01, true), (-0.02, false)] {
             sc.flat_disc(v.pos.0, v.pos.1, v.size / 2.0, z, up, METAL);
             sc.flat_disc(v.pos.0, v.pos.1, v.size * 0.22, z + if up { 0.01 } else { -0.01 }, up, hole);
+        }
+    }
+    // Board texts: silkscreen in white, outer copper under the mask.
+    for t in &p.texts {
+        let (z, up, col, shown) = match t.layer {
+            TextLayer::SilkFront => (top + 0.025, true, Color32::from_rgb(235, 235, 228), cam.show_silk),
+            TextLayer::SilkBack => (-0.035, false, Color32::from_rgb(235, 235, 228), cam.show_silk),
+            TextLayer::Copper(Layer::Front) => (top + 0.008, true, Color32::from_rgb(52, 140, 72), cam.show_tracks),
+            TextLayer::Copper(Layer::Back) => (-0.012, false, Color32::from_rgb(52, 140, 72), cam.show_tracks),
+            TextLayer::Copper(_) => (0.0, true, col_none(), false),
+        };
+        if !shown {
+            continue;
+        }
+        let width = crate::font::stroke_width(t.size);
+        for s in crate::font::board_strokes(t) {
+            for w2 in s.windows(2) {
+                sc.flat_line(w2[0], w2[1], width, z, up, col);
+            }
         }
     }
     // Silkscreen outlines.
@@ -421,7 +458,8 @@ impl App {
             self.cam3d = Cam3D { show_parts: self.cam3d.show_parts, show_tracks: self.cam3d.show_tracks, show_silk: self.cam3d.show_silk, ..Default::default() };
         }
 
-        let scene = build_scene(self);
+        let zones = crate::pcb::zone_triangles(self);
+        let scene = build_scene(self, &zones);
         let b = &self.project.board;
         let center = [(b.x0 + b.x1) / 2.0, -(b.y0 + b.y1) / 2.0, BOARD_T / 2.0];
         let diag = ((b.x1 - b.x0).powi(2) + (b.y1 - b.y0).powi(2)).sqrt().max(10.0);
@@ -531,4 +569,8 @@ impl App {
                 .color(Color32::GRAY),
         );
     }
+}
+
+fn col_none() -> Color32 {
+    Color32::TRANSPARENT
 }

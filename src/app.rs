@@ -24,6 +24,10 @@ pub enum Sel {
     Label(usize),
     Track(usize),
     Via(usize),
+    Text(usize),
+    Zone(usize),
+    /// A schematic annotation.
+    Note(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,7 +35,11 @@ pub enum SchTool {
     Select,
     Wire,
     Label,
+    /// Click a pin to mark it as deliberately unconnected (or click the mark again to remove it).
+    NoConnect,
     Place(Kind),
+    /// Draw an annotation.
+    Note(NoteKind),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -39,6 +47,8 @@ pub enum PcbTool {
     Select,
     Route,
     Via,
+    Text,
+    Zone,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -59,10 +69,16 @@ impl View {
 
 #[derive(Clone, Debug)]
 pub enum Drag {
-    SchComp { id: u32, start: (i32, i32), orig: (i32, i32), attached: Vec<(usize, bool, usize)> },
+    SchComp { id: u32, start: (i32, i32), orig: (i32, i32), attached: Vec<(usize, bool, usize)>, marks: Vec<(usize, u32, usize)> },
     SchLabel { idx: usize, start: (i32, i32), orig: (i32, i32) },
     SchWireEnd { start: (i32, i32), ends: Vec<(usize, bool)> },
     PcbComp { id: u32, start: (f32, f32), orig: (f32, f32) },
+    /// Dragging an end of an annotation line or a corner of a text box.
+    NoteResize { idx: usize, fixed: (i32, i32), is_a: bool },
+    /// Moving one corner of a copper zone: zone, outline, vertex.
+    ZoneVertex { zi: usize, oi: usize, vi: usize },
+    /// Moving a whole copper zone.
+    ZoneMove { zi: usize, start: (f32, f32), orig: Vec<Vec<(f32, f32)>> },
     /// Selection box being dragged (world coordinates); `add` keeps the current selection.
     Band { start: (f32, f32), cur: (f32, f32), add: bool },
     /// Moving several schematic items: parts (id, original position), wire ends
@@ -72,6 +88,9 @@ pub enum Drag {
         comps: Vec<(u32, (i32, i32))>,
         wires: Vec<(usize, (i32, i32), (i32, i32), bool, bool)>,
         labels: Vec<(usize, (i32, i32))>,
+        notes: Vec<(usize, Note)>,
+        /// No-connect marks that follow their pin: (mark, part, pin).
+        marks: Vec<(usize, u32, usize)>,
     },
     /// Moving several board items.
     PcbGroup {
@@ -79,6 +98,7 @@ pub enum Drag {
         comps: Vec<(u32, (f32, f32))>,
         tracks: Vec<(usize, (f32, f32), (f32, f32), bool, bool)>,
         vias: Vec<(usize, (f32, f32))>,
+        texts: Vec<(usize, (f32, f32))>,
     },
 }
 
@@ -145,10 +165,23 @@ pub struct App {
     pub route: Option<RouteState>,
     pub ghost_rot: u8,
     pub label_text: String,
+    /// Annotation being drawn: its kind and first point.
+    pub note_draft: Option<(NoteKind, (i32, i32))>,
+    /// Colour, size, dashes and fill of the next annotation.
+    pub note_style: Note,
     pub route_layer: Layer,
+    /// Copper zone being drawn (corners so far) and the net a new zone gets.
+    pub zone_draft: Vec<(f32, f32)>,
+    pub zone_net: String,
     /// Copper layers hidden in the board view.
     pub hidden_layers: Vec<Layer>,
     pub cam3d: crate::view3d::Cam3D,
+    /// New board text: content, size (mm) and layer.
+    pub text_input: String,
+    pub text_size: f32,
+    pub text_layer: TextLayer,
+    /// Filled copper zones as triangles (key = fingerprint of the zones).
+    pub zone_cache: Option<(u64, std::sync::Arc<crate::pcb::ZoneTris>)>,
     pub track_width: f32,
     pub nl: Netlist,
     pub erc: Vec<Issue>,
@@ -166,12 +199,21 @@ pub struct App {
     pub input: String,
     pending: Option<Receiver<Result<String, String>>>,
     pub show_ai_settings: bool,
+    pub blocks: crate::blocks::BlocksState,
+    pub fp_pick: crate::fpick::FpPicker,
     /// Put the keyboard in the Value box on the next frame (after a double-click).
     pub focus_value: bool,
     ai_found: Option<(bool, Vec<String>)>,
     native: Option<crate::filedlg::Native>,
     browser: Option<crate::filedlg::Browser>,
     recent: Vec<String>,
+    /// File (or KiCad project) the project was loaded from / saved to, and its date then.
+    pub source: Option<String>,
+    pub source_stamp: Option<std::time::SystemTime>,
+    pub watch_at: Option<std::time::Instant>,
+    /// The file changed on disk while there were edits here.
+    pub external_change: bool,
+    pub edited_since_load: bool,
     /// Folder of the open project (the AI may read it if allowed).
     project_dir: Option<PathBuf>,
     folder_pick: Option<Receiver<Option<PathBuf>>>,
@@ -182,7 +224,7 @@ pub struct App {
     online_status: String,
     pub jlc: crate::jlcui::JlcState,
     show_filter: [bool; 3],
-    ctx: egui::Context,
+    pub ctx: egui::Context,
     screenshot: Option<PathBuf>,
     frame: u64,
     shot_requested: bool,
@@ -266,9 +308,17 @@ impl App {
             route: None,
             ghost_rot: 0,
             label_text: "NET1".into(),
+            note_draft: None,
+            note_style: Note::default(),
             route_layer: Layer::Front,
+            zone_draft: vec![],
+            zone_net: String::new(),
             hidden_layers: vec![],
             cam3d: Default::default(),
+            text_input: "FerrisCad".into(),
+            text_size: 1.5,
+            text_layer: TextLayer::SilkFront,
+            zone_cache: None,
             track_width: 0.5,
             nl: Netlist::default(),
             erc: vec![],
@@ -286,11 +336,18 @@ impl App {
             input: String::new(),
             pending: None,
             show_ai_settings: false,
+            blocks: Default::default(),
+            fp_pick: Default::default(),
             focus_value: false,
             ai_found: None,
             native: None,
             browser: None,
             recent: load_recent(),
+            source: None,
+            source_stamp: None,
+            watch_at: None,
+            external_change: false,
+            edited_since_load: false,
             project_dir: None,
             folder_pick: None,
             new_doc_dir: String::new(),
@@ -308,6 +365,7 @@ impl App {
         };
         if let (Some(o), true) = (&open, opened_ok) {
             app.project_dir = project_folder(o);
+            app.track_source(o);
             if screenshot_free_of_side_effects(&app) {
                 app.remember(o);
             }
@@ -354,6 +412,12 @@ impl App {
     // ------------------------------------------------------------ analysis & history
 
     pub fn analyze(&mut self) {
+        // A no-connect mark follows its pin: drop the ones whose pin moved away.
+        if !self.project.no_connects.is_empty() {
+            let pins: std::collections::HashSet<(i32, i32)> =
+                self.project.components.iter().flat_map(|c| c.info().pins.iter().map(|pd| c.pin_pos(pd)).collect::<Vec<_>>()).collect();
+            self.project.no_connects.retain(|q| pins.contains(q));
+        }
         self.nl = build_netlist(&self.project);
         self.erc = checks::erc(&self.project, &self.nl);
         let (d, c) = checks::drc(&self.project, &self.nl);
@@ -362,10 +426,13 @@ impl App {
         self.sim = sim::simulate(&self.project, &self.nl);
         let valid = match self.sel {
             Sel::Comp(id) => self.project.find(id).is_some(),
+            Sel::Text(i) => i < self.project.texts.len(),
             Sel::Wire(i) => i < self.project.wires.len(),
             Sel::Label(i) => i < self.project.labels.len(),
             Sel::Track(i) => i < self.project.tracks.len(),
             Sel::Via(i) => i < self.project.vias.len(),
+            Sel::Zone(i) => i < self.project.zones.len(),
+            Sel::Note(i) => i < self.project.notes.len(),
             Sel::None => true,
         };
         if !valid {
@@ -384,6 +451,7 @@ impl App {
     }
 
     pub fn checkpoint(&mut self) {
+        self.edited_since_load = true;
         self.undo.push(self.project.clone());
         if self.undo.len() > 200 {
             self.undo.remove(0);
@@ -418,9 +486,25 @@ impl App {
                 return;
             }
         }
+        if !self.group.is_empty() {
+            self.rotate_group();
+            return;
+        }
+        if let Sel::Text(i) = self.sel {
+            self.checkpoint();
+            if let Some(t) = self.project.texts.get_mut(i) {
+                t.rot = (t.rot + 1) % 4;
+            }
+            return;
+        }
+        if let Sel::Note(_) = self.sel {
+            self.rotate_group();
+            return;
+        }
         if let Sel::Comp(id) = self.sel {
             self.checkpoint();
             let mode = self.mode;
+            let marks = self.nc_marks(&[id].into());
             if let Some(ci) = self.project.find(id) {
                 let c = &mut self.project.components[ci];
                 if mode == Mode::Schematic {
@@ -429,6 +513,7 @@ impl App {
                     c.pcb_rot = (c.pcb_rot + 1) % 4;
                 }
             }
+            self.place_nc_marks(&marks);
         }
     }
 
@@ -439,6 +524,12 @@ impl App {
         }
         match self.sel {
             Sel::None => return,
+            Sel::Text(i) => {
+                self.checkpoint();
+                if i < self.project.texts.len() {
+                    self.project.texts.remove(i);
+                }
+            }
             Sel::Comp(id) => {
                 self.checkpoint();
                 if let Some(ci) = self.project.find(id) {
@@ -461,6 +552,19 @@ impl App {
             Sel::Via(i) => {
                 self.checkpoint();
                 self.project.vias.remove(i);
+            }
+            Sel::Note(i) => {
+                self.checkpoint();
+                if i < self.project.notes.len() {
+                    self.project.notes.remove(i);
+                }
+            }
+            Sel::Zone(i) => {
+                self.checkpoint();
+                if i < self.project.zones.len() {
+                    self.project.zones.remove(i);
+                }
+                self.status = "Zone deleted.".into();
             }
         }
         self.sel = Sel::None;
@@ -498,6 +602,10 @@ impl App {
     }
 
     pub fn duplicate_selection(&mut self) {
+        if let Sel::Note(i) = self.sel {
+            self.duplicate_note(i);
+            return;
+        }
         let Sel::Comp(id) = self.sel else { return };
         let Some(ci) = self.project.find(id) else { return };
         self.checkpoint();
@@ -525,6 +633,13 @@ impl App {
         }
         if self.route.is_some() {
             self.finish_route();
+            return;
+        }
+        if self.note_draft.take().is_some() {
+            return;
+        }
+        if !self.zone_draft.is_empty() {
+            self.zone_draft.clear();
             return;
         }
         self.sch_tool = SchTool::Select;
@@ -555,6 +670,11 @@ impl App {
                 for w in &self.project.wires {
                     add(w.a.0 as f32, w.a.1 as f32);
                     add(w.b.0 as f32, w.b.1 as f32);
+                }
+                for n in &self.project.notes {
+                    let bb = n.bbox();
+                    add(bb.0 as f32 - 10.0, bb.1 as f32 - 10.0);
+                    add(bb.2 as f32 + 10.0, bb.3 as f32 + 10.0);
                 }
                 (0.2, 8.0, 40.0)
             }
@@ -634,7 +754,36 @@ impl App {
 
     // ------------------------------------------------------------ files
 
+    /// Editor state that belongs to one project (called when the project is swapped).
+    pub fn reset_editor_state(&mut self) {
+        self.sel = Sel::None;
+        self.group.clear();
+        self.highlight_net = None;
+        self.wire_draw = None;
+        self.route = None;
+        self.drag = None;
+        self.zone_draft.clear();
+        self.mode = Mode::Schematic;
+        self.fit_sch = true;
+        self.fit_pcb = true;
+        self.analysis_dirty = true;
+        self.external_change = false;
+    }
+
+    pub fn take_project_dir(&mut self) -> Option<PathBuf> {
+        self.project_dir.take()
+    }
+
+    pub fn restore_project_dir(&mut self, d: Option<PathBuf>) {
+        self.project_dir = d;
+    }
+
     fn save_to(&mut self, path: &str) {
+        if self.blocks.editing.is_some() {
+            // Ctrl+S while editing a block saves the block, not the project.
+            self.save_block_edit();
+            return;
+        }
         let p = PathBuf::from(path);
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
@@ -646,12 +795,17 @@ impl App {
                 self.status = format!("Saved {}", path);
                 self.project_dir = project_folder(path);
                 self.remember(path);
+                self.track_source(path);
             }
             Err(e) => self.status = format!("Couldn't save: {}", e),
         }
     }
 
     fn open_from(&mut self, path: &str) {
+        if self.blocks.editing.is_some() {
+            self.status = "Close the block editor first.".into();
+            return;
+        }
         match load_any(path) {
             Ok((p, notes)) => {
                 self.checkpoint();
@@ -667,6 +821,7 @@ impl App {
                 self.status = notes.first().cloned().unwrap_or_else(|| format!("Opened {}", path));
                 self.project_dir = project_folder(path);
                 self.remember(path);
+                self.track_source(path);
                 for n in notes {
                     self.push_msg(Role::Note, n);
                 }
@@ -793,6 +948,10 @@ impl App {
     fn handle_keys(&mut self, ctx: &egui::Context) {
         let (cmd, shift) = ctx.input(|i| (i.modifiers.command, i.modifiers.shift));
         let pressed = |k: Key| ctx.input(|i| i.key_pressed(k));
+        if (cmd && pressed(Key::R)) || pressed(Key::F5) {
+            self.reload_from_disk(false);
+            return;
+        }
         if cmd && pressed(Key::O) {
             self.open_dialog(Purpose::Open);
         }
@@ -854,14 +1013,28 @@ impl App {
                 if pressed(Key::L) {
                     self.sch_tool = SchTool::Label;
                 }
+                if pressed(Key::Q) {
+                    self.sch_tool = SchTool::NoConnect;
+                }
                 if pressed(Key::S) {
                     self.sch_tool = SchTool::Select;
+                }
+                for (key, kind) in [(Key::I, NoteKind::Line), (Key::B, NoteKind::Box), (Key::T, NoteKind::Text)] {
+                    if pressed(key) {
+                        self.sch_tool = SchTool::Note(kind);
+                    }
                 }
             }
             Mode::View3D => {}
             Mode::Pcb => {
                 if pressed(Key::X) {
                     self.pcb_tool = PcbTool::Route;
+                }
+                if pressed(Key::T) {
+                    self.pcb_tool = PcbTool::Text;
+                }
+                if pressed(Key::Z) {
+                    self.pcb_tool = PcbTool::Zone;
                 }
                 if pressed(Key::V) {
                     if self.route.is_some() {
@@ -908,6 +1081,13 @@ impl App {
                 let h = self.online_hits[0].clone();
                 self.online_fetch(&h);
             }
+        }
+        if self.frame == 3 && std::env::var_os("FERRISCAD_TEST_TEXT").is_some() {
+            self.project.texts.push(BoardText { text: "FerrisCad LED v1.0".into(), pos: (30.0, 3.5), size: 2.0, rot: 0, layer: TextLayer::SilkFront });
+            self.project.texts.push(BoardText { text: "Made with Rust".into(), pos: (30.0, 38.0), size: 1.5, rot: 0, layer: TextLayer::SilkBack });
+            self.project.texts.push(BoardText { text: "GND 5V".into(), pos: (56.0, 20.0), size: 1.5, rot: 1, layer: TextLayer::Copper(Layer::Front) });
+            self.sel = Sel::Text(0);
+            self.analysis_dirty = true;
         }
         if self.frame == 3 && std::env::var_os("FERRISCAD_TEST_LAYERS").is_some() {
             self.project.board.layers = 4;
@@ -959,6 +1139,14 @@ impl App {
                     self.open_dialog(Purpose::OpenKicad);
                     ui.close_menu();
                 }
+                if ui
+                    .add_enabled(self.source.is_some(), egui::Button::new("Reload from disk    Ctrl+R"))
+                    .on_hover_text("Read the open file again (e.g. after Claude changed it). Ctrl+Z goes back.")
+                    .clicked()
+                {
+                    self.reload_from_disk(false);
+                    ui.close_menu();
+                }
                 let recent = self.recent.clone();
                 ui.add_enabled_ui(!recent.is_empty(), |ui| {
                     ui.menu_button("Open recent", |ui| {
@@ -983,6 +1171,14 @@ impl App {
                 }
                 if ui.button("Save as…   Ctrl+Shift+S").clicked() {
                     self.open_dialog(Purpose::Save);
+                    ui.close_menu();
+                }
+                if ui
+                    .button("Export to KiCad…")
+                    .on_hover_text("Write a KiCad project (.kicad_pro, .kicad_sch, .kicad_pcb) that KiCad 8 and 9 can open")
+                    .clicked()
+                {
+                    self.open_dialog(Purpose::ExportKicad);
                     ui.close_menu();
                 }
                 if ui.button("Copy netlist to clipboard").clicked() {
@@ -1012,6 +1208,11 @@ impl App {
                 }
                 if ui.button("Delete    Del").clicked() {
                     self.delete_selection();
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Blocks…").on_hover_text("Save part of the circuit as a reusable block, or insert one").clicked() {
+                    self.blocks.open = true;
                     ui.close_menu();
                 }
             });
@@ -1157,6 +1358,9 @@ impl App {
                 );
                 ui.add_space(4.0);
             }
+            if matches!(self.mode, Mode::Schematic | Mode::Pcb) && ui.button("📦  Blocks…").on_hover_text("Reuse a saved part of a circuit, or save the selection as a block").clicked() {
+                self.blocks.open = true;
+            }
             match self.mode {
                 Mode::Schematic => {
                     ui.label(RichText::new("TOOLS").small().strong().color(Color32::GRAY));
@@ -1169,11 +1373,28 @@ impl App {
                     if Self::tool_button(ui, self.sch_tool == SchTool::Label, "🏷  Net label", "Wires with the same label are connected (L)") {
                         self.sch_tool = SchTool::Label;
                     }
+                    if Self::tool_button(ui, self.sch_tool == SchTool::NoConnect, "❌  No connect", "Click a pin that is left open on purpose, so the checks stop reporting it (Q). Click the mark again to remove it.") {
+                        self.sch_tool = SchTool::NoConnect;
+                    }
                     if self.sch_tool == SchTool::Label {
                         ui.horizontal(|ui| {
                             ui.label("Name");
                             ui.add(egui::TextEdit::singleline(&mut self.label_text).desired_width(110.0));
                         });
+                    }
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("ANNOTATE").small().strong().color(Color32::GRAY));
+                    for (kind, title, help) in [
+                        (NoteKind::Line, "➖  Line", "Separate parts of the circuit: click each point, right-click or Esc ends (I)"),
+                        (NoteKind::Box, "📝  Text box", "Frame a section or write notes: drag, or click two corners (B)"),
+                        (NoteKind::Text, "T  Text", "Write on the schematic: click where it starts (T)"),
+                    ] {
+                        if Self::tool_button(ui, self.sch_tool == SchTool::Note(kind), title, help) {
+                            self.sch_tool = SchTool::Note(kind);
+                        }
+                    }
+                    if let SchTool::Note(kind) = self.sch_tool {
+                        crate::annot::note_style_controls(ui, kind, &mut self.note_style);
                     }
                     ui.add_space(6.0);
                     self.online_panel(ui);
@@ -1230,7 +1451,57 @@ impl App {
                     if Self::tool_button(ui, self.pcb_tool == PcbTool::Via, "○  Add via", "Connects all copper layers (through via)") {
                         self.pcb_tool = PcbTool::Via;
                     }
+                    if Self::tool_button(ui, self.pcb_tool == PcbTool::Text, "T  Add text", "Write text on the silkscreen or copper (T)") {
+                        self.pcb_tool = PcbTool::Text;
+                    }
+                    if Self::tool_button(ui, self.pcb_tool == PcbTool::Zone, "▨  Copper zone", "Draw a copper pour (Z): click the corners, double-click or Enter to close") {
+                        self.pcb_tool = PcbTool::Zone;
+                    }
+                    if self.pcb_tool == PcbTool::Zone {
+                        let mut names: Vec<String> = self.nl.nets.iter().filter(|n| !n.pins.is_empty()).map(|n| n.name.clone()).collect();
+                        names.sort();
+                        names.dedup();
+                        if !names.contains(&self.zone_net) {
+                            self.zone_net = names.iter().find(|n| *n == "GND").or(names.first()).cloned().unwrap_or_default();
+                        }
+                        egui::Frame::none().fill(Color32::from_rgb(232, 238, 250)).rounding(6.0).inner_margin(6.0).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Net");
+                                egui::ComboBox::from_id_salt("new_zone_net").selected_text(self.zone_net.clone()).show_ui(ui, |ui| {
+                                    for n in &names {
+                                        ui.selectable_value(&mut self.zone_net, n.clone(), n);
+                                    }
+                                });
+                            });
+                            ui.label(RichText::new(format!("Layer: {} (pick it in the layer list below).", self.route_layer.name())).small().color(Color32::GRAY));
+                            ui.label(RichText::new("Click the corners, double-click or Enter to close, Esc cancels.").small().color(Color32::GRAY));
+                        });
+                    }
+                    if self.pcb_tool == PcbTool::Text {
+                        egui::Frame::none().fill(Color32::from_rgb(232, 238, 250)).rounding(6.0).inner_margin(6.0).show(ui, |ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.text_input).hint_text("Text to write").desired_width(ui.available_width()));
+                            ui.horizontal(|ui| {
+                                ui.label("Height");
+                                ui.add(egui::DragValue::new(&mut self.text_size).speed(0.05).range(0.5..=20.0).suffix(" mm"));
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                for l in text_layers(&self.project.board) {
+                                    ui.selectable_value(&mut self.text_layer, l, l.name());
+                                }
+                            });
+                            ui.label(RichText::new("Click on the board to place it. Back-side text is mirrored.").small().color(Color32::GRAY));
+                        });
+                    }
                     ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Clearance");
+                        let mut c = self.project.board.clearance;
+                        if ui.add(egui::DragValue::new(&mut c).speed(0.01).range(0.05..=2.0).suffix(" mm")).on_hover_text("Minimum copper-to-copper gap checked by the DRC").changed() {
+                            self.project.board.clearance = c;
+                            self.analysis_dirty = true;
+                            self.dirty = true;
+                        }
+                    });
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("COPPER LAYERS").small().strong().color(Color32::GRAY));
                         let mut n = self.project.board.layers;
@@ -1349,9 +1620,10 @@ impl App {
             let labels = n(|s| matches!(s, Sel::Label(_)));
             let tracks = n(|s| matches!(s, Sel::Track(_)));
             let vias = n(|s| matches!(s, Sel::Via(_)));
+            let notes = n(|s| matches!(s, Sel::Note(_)));
             ui.label(RichText::new(format!("{} items selected", g.len())).strong().size(15.0));
             let mut lines = vec![];
-            for (k, label) in [(parts, "part"), (wires, "wire"), (labels, "label"), (tracks, "track"), (vias, "via")] {
+            for (k, label) in [(parts, "part"), (wires, "wire"), (labels, "label"), (tracks, "track"), (vias, "via"), (notes, "annotation")] {
                 if k > 0 {
                     lines.push(format!("{} {}{}", k, label, if k > 1 { "s" } else { "" }));
                 }
@@ -1377,6 +1649,48 @@ impl App {
             Sel::None => {
                 ui.label(RichText::new("Nothing selected. Click a part, wire or track.").color(Color32::GRAY));
             }
+            Sel::Text(i) => {
+                ui.label(RichText::new("Board text").strong().size(15.0));
+                if i < self.project.texts.len() {
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.project.texts[i].text).desired_width(ui.available_width()));
+                    if r.gained_focus() {
+                        self.undo.push(self.project.clone());
+                    }
+                    if r.changed() {
+                        self.dirty = true;
+                    }
+                    let mut size = self.project.texts[i].size;
+                    ui.horizontal(|ui| {
+                        ui.label("Height");
+                        if ui.add(egui::DragValue::new(&mut size).speed(0.05).suffix(" mm")).changed() {
+                            self.project.texts[i].size = size.clamp(0.5, 20.0);
+                            self.dirty = true;
+                        }
+                    });
+                    let current = self.project.texts[i].layer;
+                    let mut pick = None;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Layer");
+                        for l in text_layers(&self.project.board) {
+                            if ui.selectable_label(current == l, l.name()).clicked() && current != l {
+                                pick = Some(l);
+                            }
+                        }
+                    });
+                    if let Some(l) = pick {
+                        self.checkpoint();
+                        self.project.texts[i].layer = l;
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("🔄 Rotate").on_hover_text("R").clicked() {
+                            self.rotate_selection();
+                        }
+                        if ui.button("🗑 Delete").on_hover_text("Del").clicked() {
+                            self.delete_selection();
+                        }
+                    });
+                }
+            }
             Sel::Comp(id) => {
                 let Some(ci) = self.project.find(id) else { return };
                 let inf = self.project.components[ci].info();
@@ -1384,6 +1698,7 @@ impl App {
                 let kind = self.project.components[ci].kind;
                 let mut flip: Option<&str> = None;
                 let mut jlc_find: Option<u32> = None;
+                let mut pick_fp: Option<u32> = None;
                 egui::Grid::new("props").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                     if !kind.is_power() {
                         ui.label("Reference");
@@ -1438,12 +1753,20 @@ impl App {
                         ui.end_row();
                         ui.label("Footprint");
                         let short = inf.footprint.rsplit(':').next().unwrap_or("").to_string();
-                        ui.add(egui::Label::new(short).truncate()).on_hover_text(&inf.footprint);
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Label::new(short).truncate()).on_hover_text(&inf.footprint);
+                            if ui.small_button("Change…").on_hover_text("Pick another footprint (package size, KiCad library)").clicked() {
+                                pick_fp = Some(id);
+                            }
+                        });
                         ui.end_row();
                     }
                 });
                 if let Some(v) = flip {
                     self.set_value(id, v);
+                }
+                if let Some(fid) = pick_fp {
+                    self.open_fp_picker(fid);
                 }
                 if let Some(fid) = jlc_find {
                     if let Some(i) = self.project.find(fid) {
@@ -1585,6 +1908,8 @@ impl App {
                     self.delete_selection();
                 }
             }
+            Sel::Zone(i) => self.zone_properties(ui, i),
+            Sel::Note(i) => self.note_properties(ui, i),
             Sel::Via(i) => {
                 ui.label(RichText::new("Via").strong().size(15.0));
                 let net = self.conn.via_net(i).map(|n| self.nl.nets[n].name.clone()).unwrap_or_else(|| "(none)".into());
@@ -2011,6 +2336,10 @@ impl App {
     }
 
     pub fn new_project(&mut self) {
+        if self.blocks.editing.is_some() {
+            self.status = "Close the block editor first.".into();
+            return;
+        }
         self.checkpoint();
         self.project = Project { name: "New circuit".into(), ..Default::default() };
         self.path.clear();
@@ -2026,6 +2355,14 @@ impl App {
 
     /// Show the system's file dialog (or the built-in browser if there is none).
     pub fn open_dialog(&mut self, purpose: Purpose) {
+        if self.blocks.editing.is_some() {
+            if purpose.saving() {
+                self.save_block_edit();
+            } else {
+                self.status = "Close the block editor first.".into();
+            }
+            return;
+        }
         if self.native.is_some() || self.browser.is_some() {
             return;
         }
@@ -2037,13 +2374,17 @@ impl App {
         } else {
             default_dir()
         };
-        if purpose == Purpose::Save {
+        if purpose.saving() {
             let _ = std::fs::create_dir_all(&dir);
         }
         if !dir.is_dir() {
             dir = dir.parent().map(|p| p.to_path_buf()).filter(|p| p.is_dir()).unwrap_or_else(|| PathBuf::from("."));
         }
-        let name = sugg.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "circuit.fcad".into());
+        let mut name = sugg.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "circuit.fcad".into());
+        if purpose == Purpose::ExportKicad {
+            let stem = PathBuf::from(&name).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "circuit".into());
+            name = format!("{}.kicad_pro", stem);
+        }
         if std::env::var_os("FERRISCAD_BUILTIN_DIALOG").is_some() {
             self.browser = Some(crate::filedlg::Browser::new(purpose, dir, name));
         } else {
@@ -2052,13 +2393,64 @@ impl App {
     }
 
     fn picked(&mut self, purpose: Purpose, path: PathBuf) {
+        // Work with the real location, not the dialog's one-file "document portal" path.
+        let path = crate::filedlg::host_path(&path);
         let s = path.to_string_lossy().to_string();
         match purpose {
             Purpose::Save => {
                 let p = if s.ends_with(".fcad") || s.ends_with(".vpcb") { s } else { format!("{}.fcad", s) };
                 self.save_to(&p);
             }
+            Purpose::ExportKicad => self.export_kicad(&s),
             _ => self.open_from(&s),
+        }
+    }
+
+    /// Write the project as a KiCad project (.kicad_pro + .kicad_sch + .kicad_pcb).
+    pub fn export_kicad(&mut self, path: &str) {
+        let base = path.trim_end_matches(".kicad_pro").trim_end_matches(".kicad_sch").trim_end_matches(".kicad_pcb");
+        let mut pro = PathBuf::from(format!("{}.kicad_pro", base));
+        if crate::filedlg::is_portal_path(&pro) {
+            // The dialog only opened access to this one file. Create it, then ask the portal
+            // where it really lives, so the schematic and board go into the same real folder.
+            let _ = std::fs::write(&pro, "{}");
+            let real = crate::filedlg::host_path(&pro);
+            if crate::filedlg::is_portal_path(&real) {
+                self.status = "The file dialog only gave access to one file, so the schematic and board can't be written next to it. \
+                               Choose a folder in your home directory, or use the built-in browser."
+                    .into();
+                self.push_msg(Role::Error, self.status.clone());
+                return;
+            }
+            pro = real;
+        }
+        if self.analysis_dirty {
+            self.analyze();
+            self.analysis_dirty = false;
+        }
+        match crate::kicad_export::export(&self.project, &self.nl, &self.conn, &pro) {
+            Ok(files) => {
+                let missing: Vec<String> = files.iter().filter(|f| !f.is_file()).map(|f| f.display().to_string()).collect();
+                if !missing.is_empty() {
+                    self.status = format!("KiCad export incomplete: {} wasn't created.", missing.join(", "));
+                    self.push_msg(Role::Error, self.status.clone());
+                    return;
+                }
+                let names: Vec<String> = files.iter().filter_map(|f| f.file_name().map(|n| n.to_string_lossy().to_string())).collect();
+                self.status = format!("Exported to KiCad: {}", names.join(", "));
+                self.push_msg(
+                    Role::Note,
+                    format!(
+                        "Exported to KiCad in {}: {}. Open the .kicad_pro in KiCad 8 or 9.",
+                        pro.parent().map(|d| d.display().to_string()).unwrap_or_default(),
+                        names.join(", ")
+                    ),
+                );
+            }
+            Err(e) => {
+                self.status = format!("Couldn't export to KiCad: {}", e);
+                self.push_msg(Role::Error, self.status.clone());
+            }
         }
     }
 
@@ -2317,10 +2709,16 @@ impl App {
         ui.horizontal(|ui| {
             let hint = match (self.mode, self.sch_tool, self.pcb_tool) {
                 (Mode::Schematic, SchTool::Wire, _) => "Wire: click to start, click to bend, click a pin or double-click to finish · Esc ends",
+                (Mode::Schematic, SchTool::NoConnect, _) => "No connect: click a pin left open on purpose · click the cross again to remove it · Esc stops",
                 (Mode::Schematic, SchTool::Label, _) => "Label: click on a wire to name its net",
+                (Mode::Schematic, SchTool::Note(NoteKind::Line), _) => "Line: click each point · right-click or Esc ends",
+                (Mode::Schematic, SchTool::Note(NoteKind::Box), _) => "Text box: drag, or click two opposite corners · Esc cancels",
+                (Mode::Schematic, SchTool::Note(NoteKind::Text), _) => "Text: click where it starts, then type · Esc stops",
                 (Mode::Schematic, SchTool::Place(_), _) => "Click to place · R rotates · Esc stops",
                 (Mode::Pcb, _, PcbTool::Route) => "Route: click a pad, click to bend, click the target pad · V via + switch layer · Esc ends",
                 (Mode::Pcb, _, PcbTool::Via) => "Click to drop a via",
+                (Mode::Pcb, _, PcbTool::Zone) => "Zone: click the corners · double-click or Enter closes · Esc cancels",
+                (Mode::Pcb, _, PcbTool::Text) => "Click to place the text · R rotates the selected text · Esc stops",
                 (Mode::Schematic, _, _) => "Drag to move · drag on empty space to select several · Shift+click adds · Ctrl+A all · double-click edits a value",
                 _ => "Drag to move · drag on empty space to select several · Shift+click adds · scroll to zoom · right-drag to pan",
             };
@@ -2391,6 +2789,13 @@ fn project_folder(path: &str) -> Option<PathBuf> {
     }
 }
 
+/// Layers a board text can be on: silkscreens first, then every copper layer.
+pub fn text_layers(b: &Board) -> Vec<TextLayer> {
+    let mut v = vec![TextLayer::SilkFront, TextLayer::SilkBack];
+    v.extend(b.copper().into_iter().map(TextLayer::Copper));
+    v
+}
+
 fn load_recent() -> Vec<String> {
     ai::config_dir()
         .and_then(|d| std::fs::read_to_string(d.join("recent.json")).ok())
@@ -2402,7 +2807,7 @@ fn load_recent() -> Vec<String> {
 }
 
 /// Open a FerrisCad project or import a KiCad one; returns notes about the import.
-fn load_any(path: &str) -> Result<(Project, Vec<String>), String> {
+pub fn load_any(path: &str) -> Result<(Project, Vec<String>), String> {
     let pb = std::path::Path::new(path);
     if crate::kicad::is_kicad_path(pb) {
         let im = crate::kicad::import(pb)?;
@@ -2456,6 +2861,7 @@ impl eframe::App for App {
         self.poll_ai();
         self.poll_online();
         self.poll_jlc();
+        self.watch_source();
         self.ai.project_dir = self.project_dir.clone();
         self.handle_keys(ctx);
         self.hover_info.clear();
@@ -2465,6 +2871,8 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("toolbar")
             .frame(egui::Frame::none().fill(Color32::from_rgb(248, 249, 252)).inner_margin(egui::Margin::symmetric(4.0, 6.0)))
             .show(ctx, |ui| self.toolbar(ui));
+        self.reload_banner(ctx);
+        self.block_banner(ctx);
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
         egui::TopBottomPanel::bottom("problems").resizable(true).default_height(150.0).min_height(60.0).show(ctx, |ui| {
             ui.add_space(4.0);
@@ -2485,6 +2893,8 @@ impl eframe::App for App {
         self.file_dialogs(ctx);
         self.ai_settings_ui(ctx);
         self.jlc_window(ctx);
+        self.blocks_window(ctx);
+        self.fp_window(ctx);
         self.take_screenshot(ctx);
     }
 }

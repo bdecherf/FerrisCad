@@ -12,11 +12,11 @@ const BODY: Color32 = Color32::from_rgb(38, 62, 128);
 const FILL: Color32 = Color32::from_rgb(234, 240, 252);
 const REF: Color32 = Color32::from_rgb(0, 102, 160);
 const VALUE: Color32 = Color32::from_rgb(90, 90, 96);
-const SELECT: Color32 = Color32::from_rgb(255, 140, 0);
+pub const SELECT: Color32 = Color32::from_rgb(255, 140, 0);
 const HILITE: Color32 = Color32::from_rgb(230, 60, 170);
 const POWER: Color32 = Color32::from_rgb(170, 40, 40);
 
-fn snap_i(v: f32) -> i32 {
+pub fn snap_i(v: f32) -> i32 {
     ((v / GRID as f32).round() as i32) * GRID
 }
 
@@ -28,29 +28,67 @@ pub struct Sym<'a> {
     pub r: u8,
     pub st: Stroke,
     pub fill: Color32,
+    /// When set, shapes are recorded (in the symbol's own coordinates) instead of painted.
+    pub rec: Option<&'a std::cell::RefCell<Vec<Prim>>>,
+}
+
+/// A recorded drawing primitive, in symbol coordinates (schematic units, y down).
+#[derive(Clone, Debug)]
+pub enum Prim {
+    Line(Vec<(f32, f32)>, bool),
+    Circle(f32, f32, f32, bool),
+    Text(f32, f32, String),
 }
 
 impl Sym<'_> {
+    fn record(&self, p: Prim) -> bool {
+        match self.rec {
+            Some(r) => {
+                r.borrow_mut().push(p);
+                true
+            }
+            None => false,
+        }
+    }
     pub fn pt(&self, x: f32, y: f32) -> Pos2 {
         let (rx, ry) = rot_f((x, y), self.r);
         self.v.s(self.min, (self.o.0 + rx, self.o.1 + ry))
     }
     pub fn l(&self, x0: f32, y0: f32, x1: f32, y1: f32) {
+        if self.record(Prim::Line(vec![(x0, y0), (x1, y1)], false)) {
+            return;
+        }
         self.p.line_segment([self.pt(x0, y0), self.pt(x1, y1)], self.st);
     }
     pub fn thick(&self, x0: f32, y0: f32, x1: f32, y1: f32) {
+        if self.record(Prim::Line(vec![(x0, y0), (x1, y1)], false)) {
+            return;
+        }
         self.p.line_segment([self.pt(x0, y0), self.pt(x1, y1)], Stroke::new(self.st.width * 2.0, self.st.color));
     }
     pub fn pl(&self, pts: &[(f32, f32)]) {
+        if self.record(Prim::Line(pts.to_vec(), false)) {
+            return;
+        }
         self.p.add(Shape::line(pts.iter().map(|&(x, y)| self.pt(x, y)).collect(), self.st));
     }
     pub fn poly(&self, pts: &[(f32, f32)], fill: Color32) {
+        let mut closed = pts.to_vec();
+        if let Some(f) = pts.first() {
+            closed.push(*f);
+        }
+        if self.record(Prim::Line(closed, fill.a() > 0)) {
+            return;
+        }
         self.p.add(Shape::convex_polygon(pts.iter().map(|&(x, y)| self.pt(x, y)).collect(), fill, self.st));
     }
     pub fn rect(&self, x0: f32, y0: f32, x1: f32, y1: f32) {
         self.poly(&[(x0, y0), (x1, y0), (x1, y1), (x0, y1)], self.fill);
     }
     pub fn circ(&self, x: f32, y: f32, r: f32, fill: Color32) {
+        if self.record(Prim::Circle(x, y, r, fill.a() > 0)) {
+            return;
+        }
         self.p.circle(self.pt(x, y), r * self.v.zoom, fill, self.st);
     }
     pub fn arc(&self, cx: f32, cy: f32, r: f32, a0: f32, a1: f32) {
@@ -64,6 +102,9 @@ impl Sym<'_> {
         self.pl(&pts);
     }
     pub fn text(&self, x: f32, y: f32, s: &str, size: f32, color: Color32, align: Align2) {
+        if self.record(Prim::Text(x, y, s.to_string())) {
+            return;
+        }
         let px = size * self.v.zoom;
         if px >= 4.0 {
             self.p.text(self.pt(x, y), align, s, FontId::proportional(px), color);
@@ -95,10 +136,38 @@ pub fn draw_symbol(
     sel: bool,
     cu: Option<&Custom>,
 ) {
+    draw_symbol_rec(p, v, min, kind, reference, value, pos, rot, alpha, sel, cu, None);
+}
+
+/// The drawing of a built-in symbol as primitives (for the KiCad export).
+pub fn record_builtin(kind: Kind, value: &str) -> Vec<Prim> {
+    let cell = std::cell::RefCell::new(vec![]);
+    let ctx = egui::Context::default();
+    let painter = Painter::new(ctx, egui::LayerId::background(), Rect::EVERYTHING);
+    let view = View { offset: Vec2::ZERO, zoom: 1.0 };
+    draw_symbol_rec(&painter, view, Pos2::ZERO, kind, "", value, (0, 0), 0, 1.0, false, None, Some(&cell));
+    cell.into_inner()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_symbol_rec(
+    p: &Painter,
+    v: View,
+    min: Pos2,
+    kind: Kind,
+    reference: &str,
+    value: &str,
+    pos: (i32, i32),
+    rot: u8,
+    alpha: f32,
+    sel: bool,
+    cu: Option<&Custom>,
+    rec: Option<&std::cell::RefCell<Vec<Prim>>>,
+) {
     let a = |c: Color32| c.gamma_multiply(alpha);
     let w = (1.4 * v.zoom / 1.6).clamp(0.8, 3.0);
     let body = if kind.is_power() { if kind == Kind::Gnd { a(Color32::from_rgb(40, 40, 48)) } else { a(POWER) } } else { a(BODY) };
-    let s = Sym { p, v, min, o: (pos.0 as f32, pos.1 as f32), r: rot, st: Stroke::new(w, body), fill: a(FILL) };
+    let s = Sym { p, v, min, o: (pos.0 as f32, pos.1 as f32), r: rot, st: Stroke::new(w, body), fill: a(FILL), rec };
     let inf = info(kind);
     if let Some(cu) = cu {
         draw_custom(&s, cu, kind, reference, value, sel, a(REF), a(VALUE));
@@ -247,7 +316,7 @@ pub fn draw_symbol(
             s.text(0.0, -13.0, value, 9.0, a(POWER), Align2::CENTER_BOTTOM);
         }
     }
-    if kind.is_power() {
+    if kind.is_power() || rec.is_some() {
         return;
     }
     // Reference and value text.
@@ -338,7 +407,7 @@ impl App {
                 return Sel::Wire(i);
             }
         }
-        Sel::None
+        self.note_hit(w, tol)
     }
 
     fn is_connection_point(&self, q: (i32, i32)) -> bool {
@@ -418,6 +487,7 @@ impl App {
                 None => String::new(),
             },
             Sel::Label(i) => format!("Net label {}", self.project.labels[i].text),
+            Sel::Note(i) => format!("{} (annotation)", self.project.notes[i].kind.name()),
             _ => String::new(),
         }
     }
@@ -456,7 +526,9 @@ impl App {
                         });
                         let on_part = matches!(hit0, Sel::Comp(_) | Sel::Label(_));
                         let end_grab = near_end.filter(|_| !on_part || self.sch_hit(w, tol * 0.3) == Sel::None);
-                        if !self.group.is_empty() && self.is_sel(hit0) {
+                        if !additive && self.grab_note_handle(w, tol) {
+                            // Resizing a line or a box.
+                        } else if !self.group.is_empty() && self.is_sel(hit0) {
                             // Move the whole selection.
                             self.start_sch_group_drag(start);
                         } else if additive || (hit0 == Sel::None && end_grab.is_none()) {
@@ -515,13 +587,19 @@ impl App {
                                             }
                                         }
                                     }
-                                    self.drag = Some(Drag::SchComp { id, start, orig: c.pos, attached });
+                                    let orig = c.pos;
+                                    let marks = self.nc_marks(&[id].into());
+                                    self.drag = Some(Drag::SchComp { id, start, orig, attached, marks });
                                     self.sel = Sel::Comp(id);
                                 }
                                 Sel::Label(idx) => {
                                     self.checkpoint();
                                     self.drag = Some(Drag::SchLabel { idx, start, orig: self.project.labels[idx].pos });
                                     self.sel = Sel::Label(idx);
+                                }
+                                Sel::Note(i) => {
+                                    self.sel = Sel::Note(i);
+                                    self.start_sch_group_drag(start);
                                 }
                                 Sel::Wire(i) => {
                                     // Move the whole wire; wires joined to its ends follow.
@@ -542,11 +620,12 @@ impl App {
                                 }
                             }
                             Drag::SchGroup { .. } => self.drag_sch_group(&d, s),
-                            Drag::SchComp { id, start, orig, attached } => {
+                            Drag::SchComp { id, start, orig, attached, marks } => {
                                 if let Some(ci) = self.project.find(id) {
                                     let np = (orig.0 + s.0 - start.0, orig.1 + s.1 - start.1);
                                     if self.project.components[ci].pos != np {
                                         self.project.components[ci].pos = np;
+                                        self.place_nc_marks(&marks);
                                         let c = self.project.components[ci].clone();
                                         let inf = c.info();
                                         for (wi, is_a, pi) in attached {
@@ -581,6 +660,7 @@ impl App {
                                     self.analysis_dirty = true;
                                 }
                             }
+                            Drag::NoteResize { idx, fixed, is_a } => self.resize_note(idx, fixed, is_a, s),
                             _ => {}
                         }
                     }
@@ -602,6 +682,7 @@ impl App {
                         }
                         Some(_) => {
                             self.project.wires.retain(|w| w.a != w.b);
+                            self.project.notes.retain(|n| !n.is_degenerate());
                             self.analysis_dirty = true;
                         }
                         None => {}
@@ -609,8 +690,9 @@ impl App {
                 }
                 if resp.double_clicked() {
                     if let Some(w) = mouse_w {
-                        if let Sel::Comp(id) = self.sch_hit(w, tol) {
-                            self.set_selection(vec![Sel::Comp(id)]);
+                        let hit = self.sch_hit(w, tol);
+                        if matches!(hit, Sel::Comp(_) | Sel::Note(_)) {
+                            self.set_selection(vec![hit]);
                             self.focus_value = true;
                         }
                     }
@@ -631,6 +713,7 @@ impl App {
                     }
                 }
             }
+            SchTool::Note(kind) => self.note_tool_input(kind, &resp, ui, view, min, snapped),
             SchTool::Wire => {
                 if resp.clicked() {
                     if let Some(s) = snapped {
@@ -639,6 +722,37 @@ impl App {
                 }
                 if resp.secondary_clicked() {
                     self.finish_wire();
+                }
+            }
+            SchTool::NoConnect => {
+                if resp.clicked() {
+                    if let Some((mx, my)) = mouse_w {
+                        let near = |q: (i32, i32)| ((q.0 as f32 - mx).powi(2) + (q.1 as f32 - my).powi(2)).sqrt();
+                        let reach = tol.max(8.0);
+                        // The closest pin, or an existing mark, within reach.
+                        let pin = self
+                            .project
+                            .components
+                            .iter()
+                            .filter(|c| !c.kind.is_power())
+                            .flat_map(|c| c.info().pins.iter().map(|pd| c.pin_pos(pd)).collect::<Vec<_>>())
+                            .filter(|&q| near(q) <= reach)
+                            .min_by(|a, b| near(*a).partial_cmp(&near(*b)).unwrap());
+                        let mark = self.project.no_connects.iter().position(|&q| near(q) <= reach);
+                        match (pin, mark) {
+                            (_, Some(i)) if pin.map_or(true, |p| self.project.no_connects[i] == p) => {
+                                self.checkpoint();
+                                self.project.no_connects.remove(i);
+                                self.status = "No-connect mark removed.".into();
+                            }
+                            (Some(p), _) => {
+                                self.checkpoint();
+                                self.project.no_connects.push(p);
+                                self.status = "Pin marked as not connected.".into();
+                            }
+                            _ => self.status = "Click on a pin.".into(),
+                        }
+                    }
                 }
             }
             SchTool::Label => {
@@ -668,7 +782,7 @@ impl App {
                 }
             }
         }
-        if resp.secondary_clicked() && self.sch_tool != SchTool::Wire {
+        if resp.secondary_clicked() && !matches!(self.sch_tool, SchTool::Wire | SchTool::Note(_)) {
             self.sch_tool = SchTool::Select;
         }
 
@@ -692,6 +806,14 @@ impl App {
                 for gy in gy0..=gy1 {
                     let p = view.s(min, ((gx * step) as f32, (gy * step) as f32));
                     painter.rect_filled(Rect::from_center_size(p, Vec2::splat(1.5)), 0.0, GRID_DOT);
+                }
+            }
+        }
+        // Annotations go underneath the circuit.
+        for boxes in [true, false] {
+            for (i, n) in self.project.notes.iter().enumerate() {
+                if (n.kind == NoteKind::Box) == boxes {
+                    crate::annot::draw_note(&painter, view, min, n, self.is_sel(Sel::Note(i)), false);
                 }
             }
         }
@@ -830,6 +952,8 @@ impl App {
                         painter.add(Shape::line(line, Stroke::new(ww, WIRE.gamma_multiply(0.7))));
                     }
                 }
+                SchTool::NoConnect => {}
+                SchTool::Note(kind) => self.draw_note_preview(kind, &painter, view, min, s),
                 SchTool::Label => {
                     let sp = view.s(min, (s.0 as f32, s.1 as f32));
                     painter.text(sp + Vec2::new(2.0, -2.0), Align2::LEFT_BOTTOM, &self.label_text, FontId::monospace((9.0 * z).max(8.0)), Color32::from_gray(120));

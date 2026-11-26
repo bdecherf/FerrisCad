@@ -382,6 +382,12 @@ pub fn circuit_report(p: &Project, nl: &Netlist, issues: &[Issue], sim: &SimResu
         let volt = sim.net_v.get(ni).copied().flatten().map(|v| format!(" ({})", fmt_si(v, "V"))).unwrap_or_default();
         s.push_str(&format!("- {}{}: {}\n", net.name, volt, if pins.is_empty() { "(no pins)".into() } else { pins.join(", ") }));
     }
+    if p.notes.iter().any(|n| !n.text.trim().is_empty()) {
+        s.push_str("\nSCHEMATIC NOTES (written on the drawing):\n");
+        for n in p.notes.iter().filter(|n| !n.text.trim().is_empty()) {
+            s.push_str(&format!("- at {},{}: {}\n", n.a.0, n.a.1, n.text.trim().replace('\n', " / ")));
+        }
+    }
     s.push_str("\nCHECK RESULTS:\n");
     if issues.is_empty() {
         s.push_str("- no problems found\n");

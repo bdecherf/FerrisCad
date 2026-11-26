@@ -285,6 +285,8 @@ pub fn import(path: &Path) -> Result<Imported, String> {
 // ---------------------------------------------------------------- schematic
 
 struct Inst<'a> {
+    /// Part type saved by a FerrisCad export.
+    fc_kind: Option<Kind>,
     lcsc: String,
     lib_id: String,
     at: (f32, f32, f32),
@@ -330,7 +332,23 @@ fn content_bbox(root: &Sx) -> Option<(f32, f32, f32, f32)> {
                     add(a);
                 }
             }
-            "wire" => {
+            "text" => {
+                if let Some(a) = item.xy("at") {
+                    add(a);
+                }
+            }
+            "text_box" => {
+                if let (Some(a), Some(sz)) = (item.xy("at"), item.xy("size")) {
+                    add(a);
+                    add((a.0 + sz.0, a.1 + sz.1));
+                }
+            }
+            "rectangle" => {
+                for a in [item.xy("start"), item.xy("end")].into_iter().flatten() {
+                    add(a);
+                }
+            }
+            "wire" | "polyline" => {
                 if let Some(pts) = item.get("pts") {
                     pts.all("xy").for_each(|xy| add((xy.num(1), xy.num(2))));
                 }
@@ -365,7 +383,69 @@ fn add_drawing(p: &mut Project, reference: String, value: String, cu: Custom, po
         pcb_rot: 0,
         custom: Some(Box::new(cu)),
         lcsc: String::new(),
+        fp_over: None,
     });
+}
+
+/// Graphic lines, rectangles, text and text boxes of one sheet.
+fn import_notes(root: &Sx, p: &mut Project, off: (f32, f32)) {
+    let pt = |q: (f32, f32)| (((q.0 + off.0) * U).round() as i32, ((q.1 + off.1) * U).round() as i32);
+    // A colour with zero opacity means "KiCad's default".
+    let colour = |s: Option<&Sx>| {
+        s.and_then(|s| s.get("color"))
+            .filter(|c| c.num(4) > 0.0)
+            .map(|c| NoteColor::nearest((c.num(1), c.num(2), c.num(3))))
+            .unwrap_or_default()
+    };
+    let dashed = |s: &Sx| s.get("stroke").and_then(|s| s.get("type")).map_or(false, |t| !matches!(t.arg(1), "solid" | "default"));
+    let filled = |s: &Sx| s.get("fill").and_then(|s| s.get("type")).map_or(false, |t| t.arg(1) != "none");
+    for item in root.list() {
+        let mut n = Note { dashed: dashed(item), filled: filled(item), color: colour(item.get("stroke")), ..Note::default() };
+        match item.head() {
+            "polyline" => {
+                let Some(pts) = item.get("pts") else { continue };
+                let v: Vec<(i32, i32)> = pts.all("xy").map(|xy| pt((xy.num(1), xy.num(2)))).collect();
+                for s in v.windows(2).filter(|s| s[0] != s[1]) {
+                    p.notes.push(Note { a: s[0], b: s[1], filled: false, ..n.clone() });
+                }
+                continue;
+            }
+            "rectangle" => {
+                let (Some(a), Some(b)) = (item.xy("start"), item.xy("end")) else { continue };
+                n.kind = NoteKind::Box;
+                (n.a, n.b) = (pt(a), pt(b));
+            }
+            "text" | "text_box" => {
+                let Some(a) = item.xy("at") else { continue };
+                let effects = item.get("effects");
+                let font = effects.and_then(|e| e.get("font"));
+                n.text = item.arg(1).to_string();
+                n.size = font.and_then(|f| f.get("size")).map(|s| (s.num(1) * U).round() as i32).unwrap_or(10).max(4);
+                n.color = colour(font);
+                if item.head() == "text_box" {
+                    let Some(sz) = item.xy("size") else { continue };
+                    n.kind = NoteKind::Box;
+                    (n.a, n.b) = (pt(a), pt((a.0 + sz.0, a.1 + sz.1)));
+                } else {
+                    n.kind = NoteKind::Text;
+                    n.a = pt(a);
+                    // Notes are anchored at their top-left corner; KiCad's anchor depends on
+                    // the justification (centred when none is given).
+                    let j = effects.and_then(|e| e.get("justify"));
+                    let has = |w: &str| j.map_or(false, |j| j.has_atom(w));
+                    let (w, h) = n.text_extent();
+                    let dx = if has("left") { 0.0 } else if has("right") { w } else { w / 2.0 };
+                    let dy = if has("top") { 0.0 } else if has("bottom") { h } else { h / 2.0 };
+                    n.a = (n.a.0 - dx.round() as i32, n.a.1 - dy.round() as i32);
+                }
+            }
+            _ => continue,
+        }
+        n.normalize();
+        if !n.is_degenerate() {
+            p.notes.push(n);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -410,6 +490,7 @@ fn import_schematic(root: &Sx, p: &mut Project, notes: &mut Vec<String>, off: (f
             mirror: s.get("mirror").map(|m| m.arg(1).to_string()).unwrap_or_default(),
             unit: s.get("unit").map(|u| u.num(1) as i32).unwrap_or(1),
             footprint: prop(s, "Footprint").map(|x| x.arg(2).to_string()).unwrap_or_default(),
+            fc_kind: prop(s, "FerrisCad_Kind").and_then(|x| serde_json::from_str::<Kind>(&format!("\"{}\"", x.arg(2))).ok()),
             lcsc: ["LCSC", "LCSC Part", "LCSC Part #", "LCSC#", "JLCPCB Part #", "JLC", "JLCPCB"]
                 .iter()
                 .find_map(|n| prop(s, n).map(|x| x.arg(2).trim().to_string()).filter(|v| !v.is_empty()))
@@ -457,7 +538,11 @@ fn import_schematic(root: &Sx, p: &mut Project, notes: &mut Vec<String>, off: (f
         cu.ref_pos = first.ref_at.map(local);
         cu.val_pos = first.val_at.map(local);
         let lname = first.lib_id.rsplit(':').next().unwrap_or("").to_lowercase();
-        let (kind, order) = map_kind(&first.lib_id, &lname, &first.value, is_power, &cu.pins);
+        // A FerrisCad export says what the part is, with its pins already in order.
+        let (kind, order) = match first.fc_kind {
+            Some(k) if !k.is_power() || is_power => (k, None),
+            _ => map_kind(&first.lib_id, &lname, &first.value, is_power, &cu.pins),
+        };
         if let Some(order) = order {
             let base = info(kind);
             let pins = std::mem::take(&mut cu.pins);
@@ -486,6 +571,7 @@ fn import_schematic(root: &Sx, p: &mut Project, notes: &mut Vec<String>, off: (f
             pcb_rot: 0,
             custom: Some(Box::new(cu)),
             lcsc: first.lcsc.clone(),
+            fp_over: None,
         });
     }
     for w in root.all("wire") {
@@ -512,6 +598,7 @@ fn import_schematic(root: &Sx, p: &mut Project, notes: &mut Vec<String>, off: (f
             p.no_connects.push((to_i(a.0 + off.0), to_i(a.1 + off.1)));
         }
     }
+    import_notes(root, p, off);
     for sh in root.all("sheet") {
         let name = prop(sh, "Sheetname").or_else(|| prop(sh, "Sheet name")).map(|x| x.arg(2).to_string()).unwrap_or_else(|| "Sheet".into());
         let file = prop(sh, "Sheetfile").or_else(|| prop(sh, "Sheet file")).map(|x| x.arg(2).to_string()).unwrap_or_default();
@@ -561,6 +648,9 @@ fn import_schematic(root: &Sx, p: &mut Project, notes: &mut Vec<String>, off: (f
         }
         for wr in &p.wires {
             right = right.max(wr.a.0.max(wr.b.0) as f32);
+        }
+        for n in &p.notes {
+            right = right.max(n.bbox().2 as f32);
         }
         let (right_mm, top_mm) = (right / U, if top == f32::MAX { cb.1 } else { top / U });
         let snap = |v: f32| (v / 1.27).round() * 1.27;
@@ -893,6 +983,7 @@ fn import_board(root: &Sx, p: &mut Project, notes: &mut Vec<String>, pcb_only: b
                     pcb_rot: 0,
                     custom: Some(Box::new(cu)),
                     lcsc: String::new(),
+                    fp_over: None,
                 });
             }
         }
@@ -927,6 +1018,30 @@ fn import_board(root: &Sx, p: &mut Project, notes: &mut Vec<String>, pcb_only: b
     for v in root.all("via") {
         if let Some(a) = v.xy("at") {
             p.vias.push(Via { pos: a, size: v.get("size").map_or(0.8, |s| s.num(1)) });
+        }
+    }
+    // Free text on the board (silkscreen or copper).
+    for g in root.all("gr_text") {
+        let layer_name = g.get("layer").map(|l| l.arg(1)).unwrap_or("");
+        let layer = match layer_name {
+            "F.SilkS" | "F.Silkscreen" => Some(TextLayer::SilkFront),
+            "B.SilkS" | "B.Silkscreen" => Some(TextLayer::SilkBack),
+            n if n.ends_with(".Cu") => Layer::parse(n).map(TextLayer::Copper),
+            _ => None,
+        };
+        let (Some(layer), Some(at)) = (layer, g.get("at")) else { continue };
+        let size = g
+            .get("effects")
+            .and_then(|e| e.get("font"))
+            .and_then(|f| f.get("size"))
+            .map(|s| s.num(1))
+            .filter(|s| *s > 0.0)
+            .unwrap_or(1.0);
+        let angle = at.num(3);
+        let rot = (((360.0 - angle) / 90.0).round() as i32).rem_euclid(4) as u8;
+        let text = g.arg(1).replace("\\n", " ");
+        if !text.trim().is_empty() {
+            p.texts.push(BoardText { text, pos: (at.num(1), at.num(2)), size, rot, layer });
         }
     }
     // Board outline from the Edge.Cuts drawings.
@@ -977,18 +1092,32 @@ fn import_board(root: &Sx, p: &mut Project, notes: &mut Vec<String>, pcb_only: b
     for z in root.all("zone") {
         let net = z.get("net_name").map(|n| n.arg(1).to_string()).unwrap_or_default();
         let mut any = false;
+        let outline: Vec<(f32, f32)> = z.get("polygon").and_then(|pg| pg.get("pts")).map(|ps| ps.all("xy").map(|xy| (xy.num(1), xy.num(2))).collect()).unwrap_or_default();
         for fp in z.all("filled_polygon") {
             let layer = Layer::parse(fp.get("layer").map(|l| l.arg(1)).unwrap_or(""));
             let pts: Vec<(f32, f32)> = fp.get("pts").map(|ps| ps.all("xy").map(|xy| (xy.num(1), xy.num(2))).collect()).unwrap_or_default();
             if pts.len() >= 3 {
                 any = true;
                 match p.zones.iter_mut().find(|q| q.layer == layer && q.net == net) {
-                    Some(q) => q.polys.push(pts),
-                    None => p.zones.push(Zone { layer, net: net.clone(), polys: vec![pts] }),
+                    Some(q) => {
+                        q.polys.push(pts);
+                        if outline.len() >= 3 && !q.outlines.contains(&outline) {
+                            q.outlines.push(outline.clone());
+                        }
+                    }
+                    None => p.zones.push(Zone { layer, net: net.clone(), polys: vec![pts], outlines: if outline.len() >= 3 { vec![outline.clone()] } else { vec![] }, drawn: false }),
                 }
             }
         }
+        let is_keepout = z.get("keepout").is_some();
+        let layer = z.get("layer").and_then(|l| Layer::parse(l.arg(1)));
         if any {
+            filled += 1;
+        } else if !is_keepout && !net.is_empty() && outline.len() >= 3 && layer.is_some() {
+            // Zone never filled in KiCad: keep it so it can be seen, edited and exported again.
+            let mut nz = Zone::new(layer.unwrap(), &net, outline.clone());
+            nz.drawn = true;
+            p.zones.push(nz);
             filled += 1;
         } else if !net.is_empty() {
             unfilled += 1;

@@ -565,3 +565,47 @@ impl Project {
         id
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Footprints chosen by hand
+
+/// Footprint libraries (`Package_SO`, `Resistor_SMD`...).
+pub fn fp_libraries() -> Result<Vec<String>, String> {
+    Ok(tree(FP_PROJECT, "", "footprints/_libraries.json")?
+        .into_iter()
+        .filter_map(|(n, _)| n.strip_suffix(".pretty").map(String::from))
+        .collect())
+}
+
+/// Footprint names in one library.
+pub fn fp_names(lib: &str) -> Result<Vec<String>, String> {
+    Ok(tree(FP_PROJECT, &format!("{}.pretty", lib), &format!("footprints/{}/_index.json", lib))?
+        .into_iter()
+        .filter_map(|(n, _)| n.strip_suffix(".kicad_mod").map(String::from))
+        .collect())
+}
+
+fn fp_from_text(name: &str, text: &str) -> Result<FpOver, String> {
+    let fp = kicad::parse_sx(text)?;
+    let (pads, _, silk, silk_circles) = kicad::footprint_geometry(&fp, 0.0, &|_| String::new());
+    if pads.is_empty() {
+        return Err("this footprint has no pads".into());
+    }
+    Ok(FpOver { name: name.to_string(), pads, silk, silk_circles })
+}
+
+/// A footprint from `Library:Name` (KiCad libraries, cached) or from the path of a `.kicad_mod` file.
+pub fn fetch_footprint(id: &str) -> Result<FpOver, String> {
+    let id = id.trim();
+    if id.ends_with(".kicad_mod") {
+        let text = std::fs::read_to_string(id).map_err(|e| format!("can't read {}: {}", id, e))?;
+        let name = std::path::Path::new(id).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        return fp_from_text(&name, &text);
+    }
+    let Some((lib, name)) = id.split_once(':') else {
+        return Err("write the footprint as Library:Name, e.g. Package_SO:SOIC-8_3.9x4.9mm_P1.27mm".into());
+    };
+    let url = format!("{}{}.pretty/{}.kicad_mod", FP_RAW, enc(lib), enc(name));
+    let text = cached(&format!("footprints/{}.pretty/{}.kicad_mod", lib, name), &url)?;
+    fp_from_text(id, &text)
+}

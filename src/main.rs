@@ -1,18 +1,24 @@
 #![allow(dead_code)]
 //! FerrisCad: schematic capture + PCB layout with an AI assistant for circuit debugging.
 
+mod annot;
 mod ai;
 mod aiedit;
+mod blocks;
+mod fpick;
 mod app;
 mod checks;
 mod filedlg;
+mod font;
 mod jlc;
 mod jlcui;
 mod kicad;
+mod kicad_export;
 mod model;
 mod multisel;
 mod online;
 mod pcb;
+mod reload;
 mod sch;
 mod sim;
 mod view3d;
@@ -249,6 +255,238 @@ fn main() -> eframe::Result<()> {
                 for i in issues.iter().filter(|i| i.message.contains("layer")) {
                     println!("after going back to 2 layers: {}", i.message);
                 }
+                return Ok(());
+            }
+            "--reload-test" => {
+                let path = std::env::temp_dir().join("ferriscad-reload-test.fcad");
+                let path_s = path.to_string_lossy().to_string();
+                std::fs::write(&path, serde_json::to_string_pretty(&model::demo_project()).unwrap()).unwrap();
+                let mut app = app::App::with_ctx(egui::Context::default(), Some(PathBuf::from("/dev/null")), Some(path_s.clone()));
+                let r1 = |a: &app::App| a.project.components[a.project.find_ref("R1").unwrap()].value.clone();
+                println!("opened: R1 = {}", r1(&app));
+                // Someone else (e.g. Claude) edits the file.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let text = std::fs::read_to_string(&path).unwrap().replacen("\"value\": \"22\"", "\"value\": \"220\"", 1);
+                std::fs::write(&path, text).unwrap();
+                app.watch_at = None;
+                app.watch_source();
+                println!("after outside edit, no local edits: R1 = {} | {}", r1(&app), app.status);
+                // Now edit here, then the file changes again: the app must ask.
+                app.checkpoint();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let text = std::fs::read_to_string(&path).unwrap().replacen("\"value\": \"220\"", "\"value\": \"330\"", 1);
+                std::fs::write(&path, text).unwrap();
+                app.watch_at = None;
+                app.watch_source();
+                println!("with local edits: R1 = {} | banner shown = {}", r1(&app), app.external_change);
+                app.reload_from_disk(false);
+                println!("after Reload: R1 = {} | {}", r1(&app), app.status);
+                return Ok(());
+            }
+            "--block-test" => {
+                // Save the LED-driver part of the demo as a block, insert it twice in an empty project.
+                let mut app = app::App::with_ctx(egui::Context::default(), Some(PathBuf::from("/dev/null")), None);
+                let ids: Vec<u32> = ["U2", "R2", "Q1", "R3", "D2"].iter().filter_map(|r| app.project.find_ref(r).map(|i| app.project.components[i].id)).collect();
+                app.set_selection(ids.iter().map(|&id| app::Sel::Comp(id)).collect());
+                app.analyze();
+                let b = app.make_block("LED driver").unwrap_or_else(|e| panic!("{}", e));
+                println!("block: {} comps ({} power), {} wires, {} labels, {} tracks, {} vias", b.components.len(), b.components.iter().filter(|c| c.kind.is_power()).count(), b.wires.len(), b.labels.len(), b.tracks.len(), b.vias.len());
+                let path = blocks::save(&b).unwrap_or_else(|e| panic!("{}", e));
+                let b = blocks::load(&path).expect("reload");
+                println!("saved and reloaded {} ({} blocks listed)", path.display(), blocks::list().len());
+                let mut app2 = app::App::with_ctx(egui::Context::default(), Some(PathBuf::from("/dev/null")), None);
+                app2.project = model::Project { name: "empty".into(), ..app2.project.clone() };
+                app2.project.components.clear();
+                app2.project.wires.clear();
+                app2.project.labels.clear();
+                app2.project.tracks.clear();
+                app2.project.vias.clear();
+                for k in 0..2 {
+                    let m = app2.insert_block(&b, true);
+                    if k == 0 {
+                        println!("{}", m);
+                    }
+                }
+                app2.analyze();
+                // Edit the saved block: change a value, save, check the project comes back intact.
+                let n_before = app2.project.components.len();
+                app2.begin_block_edit(&b);
+                let r2 = app2.project.find_ref("R2").unwrap();
+                app2.project.components[r2].value = "4k7".into();
+                app2.dirty = true;
+                app2.blocks.editing.as_mut().unwrap().name = "LED driver v2".into();
+                app2.save_block_edit();
+                println!("editing: {} comps in editor, saved dirty={}", app2.project.components.len(), app2.dirty);
+                app2.end_block_edit();
+                println!("back: {} comps (was {}), name {:?}", app2.project.components.len(), n_before, app2.project.name);
+                let again = blocks::list().into_iter().find(|i| i.name == "LED driver v2").and_then(|i| blocks::load(&i.path)).expect("v2");
+                println!("v2 R2 value: {}", again.components.iter().find(|c| c.reference == "R2").map(|c| c.value.clone()).unwrap_or_default());
+                let refs: Vec<String> = app2.project.components.iter().filter(|c| !c.kind.is_power()).map(|c| c.reference.clone()).collect();
+                println!("refs after 2 inserts: {:?}", refs);
+                let uniq: std::collections::BTreeSet<_> = refs.iter().collect();
+                println!("unique refs: {} | wires {} | selected group {}", uniq.len() == refs.len(), app2.project.wires.len(), app2.group.len());
+                return Ok(());
+            }
+            "--block-info" if i + 1 < args.len() => {
+                let b = blocks::load(std::path::Path::new(&args[i + 1])).expect("block");
+                let mut app = app::App::with_ctx(egui::Context::default(), Some(PathBuf::from("/dev/null")), None);
+                app.begin_block_edit(&b);
+                app.analyze();
+                let board = &app.project.board;
+                println!("board {:.1},{:.1} -> {:.1},{:.1}, {} layers", board.x0, board.y0, board.x1, board.y1, board.layers);
+                let errs: Vec<_> = app.drc.iter().filter(|i| i.severity == checks::Severity::Error).collect();
+                println!("DRC errors with a marker: {} / {} issues", errs.iter().filter(|i| i.pcb_pos.is_some()).count(), app.drc.len());
+                let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+                for i in &app.drc {
+                    *kinds.entry(format!("{:?}: {}", i.severity, i.message.chars().take(70).collect::<String>())).or_default() += 1;
+                }
+                for (k, n) in kinds { println!("  {}x {}", n, k); }
+                println!("vias {}, unrouted {}", app.project.vias.len(), app.conn.unrouted);
+                for c in app.project.components.iter().enumerate().filter(|(_, c)| c.reference == "A1" || c.reference == "IC1") {
+                    let pads: Vec<_> = app.conn.pads.iter().filter(|p| p.ci == c.0).collect();
+                    let nets: std::collections::BTreeSet<String> = pads.iter().filter_map(|p| p.net).map(|n| app.nl.nets[n].name.clone()).collect();
+                    println!("{}: {} pads drawn, {} nets", c.1.reference, pads.len(), nets.len());
+                    if c.1.reference == "A1" {
+                        for p in &pads { println!("   pad at ({:.2},{:.2}) size {:?} net {:?}", p.pos.0, p.pos.1, p.size, p.net.map(|n| app.nl.nets[n].name.clone())); }
+                    }
+                }
+                return Ok(());
+            }
+            "--nc-test" => {
+                let mut app = app::App::with_ctx(egui::Context::default(), Some(PathBuf::from("/dev/null")), None);
+                let id = app.project.add_component(model::Kind::Resistor, (600, 600), 0);
+                app.analyze();
+                let count = |a: &app::App| a.erc.iter().filter(|i| i.message.contains("not connected to anything")).count();
+                println!("open-pin warnings with a lone resistor: {}", count(&app));
+                let ci = app.project.find(id).unwrap();
+                let c = app.project.components[ci].clone();
+                for pd in c.info().pins.iter() {
+                    app.project.no_connects.push(c.pin_pos(pd));
+                }
+                app.analyze();
+                println!("after marking both pins as no-connect: {} (marks {})", count(&app), app.project.no_connects.len());
+                app.project.components[ci].pos.0 += 50;
+                app.analyze();
+                println!("after moving the resistor: warnings {} , marks kept {}", count(&app), app.project.no_connects.len());
+                return Ok(());
+            }
+            "--fp-test" if i + 1 < args.len() => {
+                let mut app = app::App::with_ctx(egui::Context::default(), Some(PathBuf::from("/dev/null")), None);
+                let id = app.project.add_component(model::Kind::Resistor, (600, 600), 0);
+                let ci = app.project.find(id).unwrap();
+                let show = |c: &model::Component, t: &str| {
+                    let inf = c.info();
+                    println!("{}: {} pads={:?}", t, inf.footprint, inf.pins.iter().map(|p| (p.pad.clone(), p.pad_pos, p.pad_size)).collect::<Vec<_>>());
+                };
+                show(&app.project.components[ci], "before");
+                match online::fetch_footprint(&args[i + 1]) {
+                    Ok(o) => {
+                        println!("loaded {} pads, {} silk", o.pads.len(), o.silk.len());
+                        app.project.components[ci].fp_over = Some(Box::new(o));
+                    }
+                    Err(e) => println!("error: {}", e),
+                }
+                show(&app.project.components[ci], "after");
+                let s = serde_json::to_string(&app.project).unwrap();
+                let back: model::Project = serde_json::from_str(&s).unwrap();
+                println!("saved+reloaded keeps override: {}", back.components.iter().any(|c| c.id == id && c.fp_over.is_some()));
+                return Ok(());
+            }
+            "--zone-test" => {
+                // Draw a GND zone over the demo board, check connectivity and the exports.
+                let mut p = model::demo_project();
+                let b = p.board.clone();
+                p.zones.push(model::Zone::new(model::Layer::Back, "GND", vec![(b.x0 + 1.0, b.y0 + 1.0), (b.x1 - 1.0, b.y0 + 1.0), (b.x1 - 1.0, b.y1 - 1.0), (b.x0 + 1.0, b.y1 - 1.0)]));
+                let nl = model::build_netlist(&p);
+                let (_, conn) = checks::drc(&p, &nl);
+                let base = model::demo_project();
+                let nl0 = model::build_netlist(&base);
+                let (_, conn0) = checks::drc(&base, &nl0);
+                println!("unrouted without zone {} -> with GND zone on back {}", conn0.unrouted, conn.unrouted);
+                let dir = std::env::temp_dir().join("ferriscad-zone-test");
+                let out = dir.join("z.kicad_pro");
+                kicad_export::export(&p, &nl, &conn, &out).map(|_| ()).unwrap_or_else(|e| println!("export error {}", e));
+                let back = kicad::import(&out).map(|x| x.project).unwrap_or_else(|e| panic!("{}", e));
+                println!("re-import: zones {} (drawn {}), outlines {}", back.zones.len(), back.zones.iter().filter(|z| z.drawn).count(), back.zones.iter().map(|z| z.outlines.len()).sum::<usize>());
+                match jlc::export(&p, &conn, &dir.join("jlc")) {
+                    Ok(e) => e.notes.iter().for_each(|n| println!("note: {}", n)),
+                    Err(e) => println!("jlc error {}", e),
+                }
+                return Ok(());
+            }
+            "--kicad-roundtrip" if i + 1 < args.len() => {
+                // Export a project to KiCad, import it back, compare every connection.
+                let src = &args[i + 1];
+                let mut p = if src == "demo" { model::demo_project() } else { kicad::import(std::path::Path::new(src)).map(|x| x.project).unwrap_or_else(|e| panic!("{}", e)) };
+                if src == "demo" {
+                    p.texts.push(model::BoardText { text: "Test v1".into(), pos: (10.0, 5.0), size: 1.5, rot: 1, layer: model::TextLayer::SilkBack });
+                    use model::{Note, NoteColor, NoteKind};
+                    p.notes.push(Note { a: (60, 40), b: (60, 420), dashed: true, color: NoteColor::Gray, filled: false, ..Default::default() });
+                    p.notes.push(Note { kind: NoteKind::Text, a: (90, 30), b: (90, 30), text: "POWER INPUT".into(), size: 20, filled: false, ..Default::default() });
+                    p.notes.push(Note { kind: NoteKind::Box, a: (90, 440), b: (330, 520), text: "Note: R1 limits the LED current.\nCheck \"D1\" polarity.".into(), color: NoteColor::Orange, ..Default::default() });
+                    p.notes.push(Note { kind: NoteKind::Box, a: (360, 60), b: (760, 400), color: NoteColor::Green, dashed: true, filled: false, ..Default::default() });
+                    p.texts.push(model::BoardText { text: "GND".into(), pos: (5.0, 8.0), size: 1.0, rot: 0, layer: model::TextLayer::Copper(model::Layer::Front) });
+                }
+                let nl = model::build_netlist(&p);
+                let (_, conn) = checks::drc(&p, &nl);
+                let dir = std::env::temp_dir().join("ferriscad-kicad-export");
+                let out = dir.join(format!("{}.kicad_pro", if src == "demo" { "demo" } else { "roundtrip" }));
+                match kicad_export::export(&p, &nl, &conn, &out) {
+                    Ok(files) => files.iter().for_each(|f| println!("wrote {} ({} bytes)", f.display(), std::fs::metadata(f).map(|m| m.len()).unwrap_or(0))),
+                    Err(e) => {
+                        println!("export error: {}", e);
+                        return Ok(());
+                    }
+                }
+                let back = kicad::import(&out).map(|x| x.project).unwrap_or_else(|e| panic!("re-import: {}", e));
+                let conns = |p: &model::Project| -> std::collections::BTreeSet<String> {
+                    let nl = model::build_netlist(p);
+                    let mut groups: Vec<Vec<String>> = nl
+                        .nets
+                        .iter()
+                        .enumerate()
+                        .map(|(n, _)| {
+                            let mut v: Vec<String> = nl
+                                .part_pins(p, n)
+                                .map(|(ci, pi)| format!("{}.{}", p.components[ci].reference, p.components[ci].info().pins[pi].name))
+                                .collect();
+                            v.sort();
+                            v
+                        })
+                        .filter(|v| v.len() > 1)
+                        .collect();
+                    groups.sort();
+                    groups.into_iter().map(|g| g.join(" ")).collect()
+                };
+                let (a, b) = (conns(&p), conns(&back));
+                println!("nets with 2+ pins: original {}, re-imported {}", a.len(), b.len());
+                for d in a.symmetric_difference(&b).take(8) {
+                    println!("  DIFF {}{}", if a.contains(d) { "only original: " } else { "only re-import: " }, d);
+                }
+                let kinds_same = p.components.iter().filter(|c| !c.kind.is_power()).all(|c| back.find_ref(&c.reference).map_or(false, |i| back.components[i].kind == c.kind));
+                println!("part types kept: {}", kinds_same);
+                let tsig = |p: &model::Project| -> Vec<String> {
+                    let mut v: Vec<String> = p.texts.iter().map(|t| format!("{}|{}|{}|{:.2}", t.text, t.layer.name(), t.rot, t.size)).collect();
+                    v.sort();
+                    v
+                };
+                let shape = |p: &model::Project| { let mut v: Vec<String> = p.notes.iter().map(|n| { let o = p.components.first().map(|c| c.pos).unwrap_or_default(); format!("{:?} {:?} {:?} {:?} {} {:?} {} {}", n.kind, (n.a.0 - o.0, n.a.1 - o.1), (n.b.0 - o.0, n.b.1 - o.1), n.text, if n.kind == model::NoteKind::Line { 0 } else { n.size }, n.color, n.dashed, n.filled) }).collect(); v.sort(); v };
+                println!("schematic notes: {} -> {}, same: {}", p.notes.len(), back.notes.len(), shape(&p) == shape(&back));
+                println!("board texts: {} -> {}, same: {}", p.texts.len(), back.texts.len(), tsig(&p) == tsig(&back));
+                if tsig(&p) != tsig(&back) {
+                    println!("  original {:?}\n  re-import {:?}", tsig(&p), tsig(&back));
+                }
+                let nl2 = model::build_netlist(&back);
+                let (_, conn2) = checks::drc(&back, &nl2);
+                println!("board: tracks {} -> {}, vias {} -> {}, unrouted {} -> {}, layers {} -> {}", p.tracks.len(), back.tracks.len(), p.vias.len(), back.vias.len(), conn.unrouted, conn2.unrouted, p.board.layers, back.board.layers);
+                return Ok(());
+            }
+            "--export-kicad" if i + 1 < args.len() => {
+                // Export the example project to a KiCad project at the given path (as the menu does).
+                let mut app = app::App::with_ctx(egui::Context::default(), Some(PathBuf::from("/dev/null")), None);
+                println!("real path: {}", filedlg::host_path(std::path::Path::new(&args[i + 1])).display());
+                app.export_kicad(&args[i + 1]);
+                println!("{}", app.status);
                 return Ok(());
             }
             "--board" => {

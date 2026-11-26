@@ -62,6 +62,18 @@ pub enum PadShape {
     Round,
 }
 
+/// A further pad of the same pin (a footprint may have several pads with one number, such as
+/// the ground tabs of a connector or a split thermal pad).
+#[derive(Clone, Debug)]
+pub struct ExtraPad {
+    pub pos: (f32, f32),
+    pub size: (f32, f32),
+    pub shape: PadShape,
+    pub tht: bool,
+    pub back: bool,
+    pub drill: f32,
+}
+
 #[derive(Clone, Debug)]
 pub struct PinDef {
     pub name: String,
@@ -74,6 +86,8 @@ pub struct PinDef {
     pub tht: bool,
     /// SMD pad on the back side.
     pub back: bool,
+    /// Other pads carrying the same number.
+    pub extra: Vec<ExtraPad>,
 }
 
 pub struct KindInfo {
@@ -100,7 +114,7 @@ fn pin(
     shape: PadShape,
     tht: bool,
 ) -> PinDef {
-    PinDef { name: name.into(), pos, ptype, pad: pad.into(), pad_pos, pad_size, shape, tht, back: false }
+    PinDef { name: name.into(), pos, ptype, pad: pad.into(), pad_pos, pad_size, shape, tht, back: false, extra: vec![] }
 }
 
 fn ppin(name: &'static str) -> PinDef {
@@ -384,6 +398,19 @@ pub struct Component {
     /// JLCPCB / LCSC part number (e.g. C17414), used for the assembly BOM.
     #[serde(default)]
     pub lcsc: String,
+    /// A footprint chosen for this part, replacing the one it came with.
+    #[serde(default)]
+    pub fp_over: Option<Box<FpOver>>,
+}
+
+/// A footprint picked by hand (from the KiCad libraries or a `.kicad_mod` file). Pads are
+/// matched to the part's pins by number.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FpOver {
+    pub name: String,
+    pub pads: Vec<CPad>,
+    pub silk: Vec<((f32, f32), (f32, f32))>,
+    pub silk_circles: Vec<(f32, f32, f32)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -454,10 +481,81 @@ pub fn reg_voltage(value: &str) -> Option<f64> {
     parse_si(tail).filter(|v| *v > 0.0 && *v < 60.0)
 }
 
+/// Bounding box of pads and silkscreen, in mm.
+fn fp_bounds(pads: &[CPad], silk: &[((f32, f32), (f32, f32))], circles: &[(f32, f32, f32)]) -> (f32, f32, f32, f32) {
+    let mut b = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    let mut add = |q: (f32, f32)| {
+        b = (b.0.min(q.0), b.1.min(q.1), b.2.max(q.0), b.3.max(q.1));
+    };
+    for p in pads {
+        add((p.pos.0 - p.size.0 / 2.0, p.pos.1 - p.size.1 / 2.0));
+        add((p.pos.0 + p.size.0 / 2.0, p.pos.1 + p.size.1 / 2.0));
+    }
+    for (a, c) in silk {
+        add(*a);
+        add(*c);
+    }
+    for &(x, y, r) in circles {
+        add((x - r, y - r));
+        add((x + r, y + r));
+    }
+    b
+}
+
 impl Component {
+    /// Pads, silkscreen lines and silkscreen circles of the footprint in use, if it has its own
+    /// geometry (a chosen footprint, or an imported one).
+    pub fn fp_geom(&self) -> Option<(&[CPad], &[((f32, f32), (f32, f32))], &[(f32, f32, f32)])> {
+        if let Some(o) = self.fp_over.as_ref().filter(|o| !o.pads.is_empty()) {
+            return Some((&o.pads, &o.silk, &o.silk_circles));
+        }
+        self.custom.as_ref().filter(|cu| !cu.pads.is_empty()).map(|cu| (&cu.pads[..], &cu.silk[..], &cu.silk_circles[..]))
+    }
+
     pub fn info(&self) -> KindInfo {
+        let mut k = self.info_inner();
+        let Some(o) = self.fp_over.as_ref().filter(|o| !o.pads.is_empty()) else { return k };
+        let numbers: Vec<String> = match &self.custom {
+            Some(cu) => cu.pins.iter().map(|p| p.number.clone()).collect(),
+            None => k.pins.iter().map(|p| p.pad.clone()).collect(),
+        };
+        let mut seen: Vec<String> = vec![];
+        for (i, pd) in k.pins.iter_mut().enumerate() {
+            pd.pad = String::new();
+            pd.pad_pos = (0.0, 0.0);
+            pd.pad_size = (0.0, 0.0);
+            pd.tht = false;
+            pd.back = false;
+            pd.extra = vec![];
+            let num = numbers.get(i).cloned().unwrap_or_default();
+            let Some(pad) = o.pads.iter().find(|p| p.number == num) else { continue };
+            if !seen.contains(&num) {
+                seen.push(num.clone());
+                pd.extra = o
+                    .pads
+                    .iter()
+                    .filter(|p| p.number == num)
+                    .skip(1)
+                    .map(|p| ExtraPad { pos: p.pos, size: p.size, shape: if p.round { PadShape::Round } else { PadShape::Rect }, tht: p.tht, back: p.back, drill: p.drill })
+                    .collect();
+            }
+            pd.pad = pad.number.clone();
+            pd.pad_pos = pad.pos;
+            pd.pad_size = pad.size;
+            pd.shape = if pad.round { PadShape::Round } else { PadShape::Rect };
+            pd.tht = pad.tht;
+            pd.back = pad.back;
+        }
+        k.footprint = o.name.clone();
+        k.fp_body = fp_bounds(&o.pads, &o.silk, &o.silk_circles);
+        k.fp_round = false;
+        k
+    }
+
+    fn info_inner(&self) -> KindInfo {
         let base = info(self.kind);
         let Some(cu) = &self.custom else { return base };
+        let mut seen: Vec<String> = vec![];
         let pins: Vec<PinDef> = cu
             .pins
             .iter()
@@ -473,8 +571,19 @@ impl Component {
                     shape: PadShape::Rect,
                     tht: false,
                     back: false,
+                    extra: vec![],
                 };
                 if let Some(pad) = cu.pads.iter().find(|p| p.number == cp.number) {
+                    if !seen.contains(&cp.number) {
+                        seen.push(cp.number.clone());
+                        pd.extra = cu
+                            .pads
+                            .iter()
+                            .filter(|p| p.number == cp.number)
+                            .skip(1)
+                            .map(|p| ExtraPad { pos: p.pos, size: p.size, shape: if p.round { PadShape::Round } else { PadShape::Rect }, tht: p.tht, back: p.back, drill: p.drill })
+                            .collect();
+                    }
                     pd.pad = pad.number.clone();
                     pd.pad_pos = pad.pos;
                     pd.pad_size = pad.size;
@@ -503,23 +612,7 @@ impl Component {
         let (fp_body, fp_round) = if cu.pads.is_empty() {
             (base.fp_body, base.fp_round)
         } else {
-            let mut b = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-            let mut add = |q: (f32, f32)| {
-                b = (b.0.min(q.0), b.1.min(q.1), b.2.max(q.0), b.3.max(q.1));
-            };
-            for p in &cu.pads {
-                add((p.pos.0 - p.size.0 / 2.0, p.pos.1 - p.size.1 / 2.0));
-                add((p.pos.0 + p.size.0 / 2.0, p.pos.1 + p.size.1 / 2.0));
-            }
-            for (a, c) in &cu.silk {
-                add(*a);
-                add(*c);
-            }
-            for &(x, y, r) in &cu.silk_circles {
-                add((x - r, y - r));
-                add((x + r, y + r));
-            }
-            (b, false)
+            (fp_bounds(&cu.pads, &cu.silk, &cu.silk_circles), false)
         };
         KindInfo {
             label: base.label,
@@ -616,6 +709,139 @@ pub struct Wire {
 pub struct Label {
     pub pos: (i32, i32),
     pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoteKind {
+    #[default]
+    Line,
+    Box,
+    Text,
+}
+
+impl NoteKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            NoteKind::Line => "Line",
+            NoteKind::Box => "Text box",
+            NoteKind::Text => "Text",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoteColor {
+    #[default]
+    Blue,
+    Black,
+    Gray,
+    Red,
+    Green,
+    Orange,
+}
+
+impl NoteColor {
+    pub const ALL: [NoteColor; 6] = [NoteColor::Blue, NoteColor::Black, NoteColor::Gray, NoteColor::Red, NoteColor::Green, NoteColor::Orange];
+    pub fn name(self) -> &'static str {
+        match self {
+            NoteColor::Blue => "Blue",
+            NoteColor::Black => "Black",
+            NoteColor::Gray => "Grey",
+            NoteColor::Red => "Red",
+            NoteColor::Green => "Green",
+            NoteColor::Orange => "Orange",
+        }
+    }
+    pub fn rgb(self) -> (u8, u8, u8) {
+        match self {
+            NoteColor::Blue => (40, 80, 170),
+            NoteColor::Black => (20, 20, 30),
+            NoteColor::Gray => (125, 125, 135),
+            NoteColor::Red => (180, 45, 45),
+            NoteColor::Green => (35, 125, 60),
+            NoteColor::Orange => (190, 105, 0),
+        }
+    }
+    /// Pale background of a filled box.
+    pub fn fill(self) -> (u8, u8, u8) {
+        let (r, g, b) = self.rgb();
+        let pale = |v: u8| (255 - (255 - v as u32) / 9) as u8;
+        (pale(r), pale(g), pale(b))
+    }
+    /// The palette colour closest to an arbitrary one.
+    pub fn nearest(rgb: (f32, f32, f32)) -> NoteColor {
+        let d = |c: NoteColor| {
+            let (r, g, b) = c.rgb();
+            (r as f32 - rgb.0).powi(2) + (g as f32 - rgb.1).powi(2) + (b as f32 - rgb.2).powi(2)
+        };
+        NoteColor::ALL.into_iter().min_by(|a, b| d(*a).total_cmp(&d(*b))).unwrap_or_default()
+    }
+}
+
+/// A schematic annotation (a drawing only, never part of the circuit).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Note {
+    pub kind: NoteKind,
+    /// Line: one end. Box: top-left corner. Text: top-left corner of the text.
+    pub a: (i32, i32),
+    /// Line: the other end. Box: bottom-right corner. Text: same as `a`.
+    pub b: (i32, i32),
+    #[serde(default)]
+    pub text: String,
+    /// Text height in schematic units.
+    pub size: i32,
+    #[serde(default)]
+    pub color: NoteColor,
+    #[serde(default)]
+    pub dashed: bool,
+    #[serde(default)]
+    pub filled: bool,
+}
+
+impl Default for Note {
+    fn default() -> Self {
+        Note { kind: NoteKind::Line, a: (0, 0), b: (0, 0), text: String::new(), size: 14, color: NoteColor::Blue, dashed: false, filled: true }
+    }
+}
+
+impl Note {
+    pub fn normalize(&mut self) {
+        match self.kind {
+            NoteKind::Box => {
+                let (a, b) = (self.a, self.b);
+                self.a = (a.0.min(b.0), a.1.min(b.1));
+                self.b = (a.0.max(b.0), a.1.max(b.1));
+            }
+            NoteKind::Text => self.b = self.a,
+            NoteKind::Line => {}
+        }
+    }
+    /// Nothing left to see or click.
+    pub fn is_degenerate(&self) -> bool {
+        match self.kind {
+            NoteKind::Line => self.a == self.b,
+            NoteKind::Box => self.a.0 == self.b.0 || self.a.1 == self.b.1,
+            NoteKind::Text => false,
+        }
+    }
+    /// Approximate size of the text, unwrapped.
+    pub fn text_extent(&self) -> (f32, f32) {
+        let shown = if self.text.is_empty() { "(empty text)" } else { &self.text };
+        let cols = shown.split('\n').map(|l| l.chars().count()).max().unwrap_or(0).max(1);
+        let rows = shown.split('\n').count();
+        (cols as f32 * self.size as f32 * 0.52, rows as f32 * self.size as f32 * 1.2)
+    }
+    pub fn bbox(&self) -> (i32, i32, i32, i32) {
+        if self.kind == NoteKind::Text {
+            let (w, h) = self.text_extent();
+            return (self.a.0, self.a.1, self.a.0 + w.ceil() as i32, self.a.1 + h.ceil() as i32);
+        }
+        (self.a.0.min(self.b.0), self.a.1.min(self.b.1), self.a.0.max(self.b.0), self.a.1.max(self.b.1))
+    }
+    pub fn shift(&mut self, d: (i32, i32)) {
+        self.a = (self.a.0 + d.0, self.a.1 + d.1);
+        self.b = (self.b.0 + d.0, self.b.1 + d.1);
+    }
 }
 
 /// A copper layer: front, back, or inner layer n (1 = just below the front).
@@ -735,12 +961,76 @@ impl Default for Board {
     }
 }
 
+/// Where a board text is printed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextLayer {
+    SilkFront,
+    SilkBack,
+    Copper(Layer),
+}
+
+impl TextLayer {
+    pub fn name(self) -> String {
+        match self {
+            TextLayer::SilkFront => "F.Silkscreen".into(),
+            TextLayer::SilkBack => "B.Silkscreen".into(),
+            TextLayer::Copper(l) => l.short(),
+        }
+    }
+    /// KiCad layer name.
+    pub fn kicad(self) -> String {
+        match self {
+            TextLayer::SilkFront => "F.SilkS".into(),
+            TextLayer::SilkBack => "B.SilkS".into(),
+            TextLayer::Copper(l) => l.short(),
+        }
+    }
+}
+
+/// Text on the board, drawn with FerrisCad's stroke font.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BoardText {
+    pub text: String,
+    /// Centre of the text (mm).
+    pub pos: (f32, f32),
+    /// Height of the capitals (mm).
+    pub size: f32,
+    /// Quarter turns.
+    #[serde(default)]
+    pub rot: u8,
+    pub layer: TextLayer,
+}
+
 /// A filled copper area (from an imported board). `layer` None = an inner layer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Zone {
     pub layer: Option<Layer>,
     pub net: String,
+    /// The filled copper (one polygon per island).
     pub polys: Vec<Vec<(f32, f32)>>,
+    /// The zone's own outline as drawn in KiCad (empty when unknown: the board outline is used).
+    #[serde(default)]
+    pub outlines: Vec<Vec<(f32, f32)>>,
+    /// Drawn or edited in FerrisCad: `polys` is just the outline (no clearance carved around
+    /// other nets). KiCad recomputes the real fill (press B), and Gerbers carve it themselves.
+    #[serde(default)]
+    pub drawn: bool,
+}
+
+impl Zone {
+    /// A zone drawn in FerrisCad.
+    pub fn new(layer: Layer, net: &str, outline: Vec<(f32, f32)>) -> Zone {
+        Zone { layer: Some(layer), net: net.to_string(), polys: vec![outline.clone()], outlines: vec![outline], drawn: true }
+    }
+    /// After the outline was edited: the fill becomes the plain outline again.
+    pub fn outline_changed(&mut self) {
+        self.polys = self.outlines.clone();
+        self.drawn = true;
+    }
+    /// Which outline (or fill island when the outline is unknown) contains `pt`?
+    pub fn contains(&self, pt: (f32, f32)) -> bool {
+        self.outlines.iter().chain(self.polys.iter()).any(|o| point_in_poly(pt, o))
+    }
 }
 
 pub fn point_in_poly(p: (f32, f32), poly: &[(f32, f32)]) -> bool {
@@ -781,6 +1071,12 @@ pub struct Project {
     pub no_connects: Vec<(i32, i32)>,
     #[serde(default)]
     pub zones: Vec<Zone>,
+    /// Text drawn on the board (silkscreen or copper).
+    #[serde(default)]
+    pub texts: Vec<BoardText>,
+    /// Annotations on the schematic.
+    #[serde(default)]
+    pub notes: Vec<Note>,
 }
 
 impl Project {
@@ -827,6 +1123,7 @@ impl Project {
             pcb_rot: 0,
             custom: None,
             lcsc: String::new(),
+            fp_over: None,
         });
         id
     }
